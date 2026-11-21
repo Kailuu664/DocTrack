@@ -1,0 +1,104 @@
+{% load doctrack %}
+<div class="tracking-queue-nav mb-3" aria-label="Tracking views">
+  <div class="tracking-queue-list">
+    <a class="pill-toggle{% if not resolved.scope and not selected_statuses %} is-active{% endif %}"
+       href="{{ all_tracking_href }}">All in Tracking</a>
+    {% if selected_scope or selected_statuses or selected_owner or selected_office_ids or resolved.overdue or selected_sort %}
+      <a class="pill-toggle" href="{% url 'search:index' %}?mode={{ tracking_mode }}{% if query %}&amp;q={{ query|urlencode }}{% endif %}" data-filter-discard>Clear filters</a>
+    {% endif %}
+  </div>
+</div>
+{% include "partials/_direction_filters.html" with groups=direction_filter_groups prefix="search-direction" %}
+<details id="search-tracking-filter-options" class="tracking-filter-disclosure"{% if selected_statuses and not selected_scope or selected_statuses|length > 1 or selected_owner or selected_office_ids or resolved.overdue or selected_sort %} open{% endif %}>
+  <summary>
+    <span><strong>More filters</strong><span class="tracking-filter-description">Multiple stages, originating office, deadline, sort, and ownership</span></span>
+    {% if selected_statuses or selected_owner or selected_office_ids or resolved.overdue or selected_sort %}<span class="tracking-filter-applied">Filters applied</span>{% endif %}
+  </summary>
+<div class="tracking-filters">
+  <div class="tracking-filter-row">
+    <span class="tracking-filter-label" id="search-status-label">Stages in this view (select one or more)</span>
+    <div class="pill-row">
+      <div class="pill-row-list" role="group" aria-labelledby="search-status-label">
+        {% for value, label in status_choices %}
+          <a class="pill-toggle{% if value in selected_statuses %} is-active{% endif %}"
+             href="{% filter_url 'status' value multi=True %}"
+             {% if value in selected_statuses %}aria-current="true"{% endif %}>
+            {{ label }}
+            <span class="visually-hidden">
+              {% if value in selected_statuses %}selected — activate to remove{% else %}activate to add{% endif %}
+            </span>
+          </a>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <div class="tracking-filter-row">
+    <span class="tracking-filter-label" id="search-office-label">Originating office</span>
+    <div class="pill-row">
+      <div class="pill-row-list" role="group" aria-labelledby="search-office-label">
+        {% for office in filter_offices %}
+          {% with selected=office.pk|stringformat:"s" %}
+            <a class="pill-toggle{% if selected in selected_office_ids %} is-active{% endif %}"
+               href="{% filter_url 'offices' office.pk multi=True %}"
+               title="{{ office.name }}"
+               {% if selected in selected_office_ids %}aria-current="true"{% endif %}>
+              {{ office.code }}
+              <span class="visually-hidden">
+                {% if selected in selected_office_ids %}selected — activate to remove{% else %}activate to add{% endif %}
+              </span>
+            </a>
+          {% endwith %}
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  {% comment %}
+    The row this page was missing. `_tracking()` has always run `owner` through
+    `apply_scope`, so `?owner=mine` narrowed the results — with no control to
+    set it and nothing on screen to say it was set. Same field, same values and
+    same label as the workspace's Show row, because it is the same filter.
+  {% endcomment %}
+  {# The same Deadline row the workspace carries — see tracking/list.html. #}
+  <div class="tracking-filter-row">
+    <span class="tracking-filter-label" id="search-deadline-label">Deadline</span>
+    <div class="pill-row">
+      <div class="pill-row-list" role="group" aria-labelledby="search-deadline-label">
+        <a class="pill-toggle{% if not resolved.overdue %} is-active{% endif %}"
+           href="{% filter_url 'overdue' '' %}"
+           {% if not resolved.overdue %}aria-current="true"{% endif %}>All deadlines</a>
+        <a class="pill-toggle{% if resolved.overdue == 'no' %} is-active{% endif %}"
+           href="{% filter_url 'overdue' 'no' %}"
+           {% if resolved.overdue == 'no' %}aria-current="true"{% endif %}>On time</a>
+        <a class="pill-toggle pill-toggle--alert{% if resolved.overdue == 'yes' %} is-active{% endif %}"
+           href="{% filter_url 'overdue' 'yes' %}"
+           {% if resolved.overdue == 'yes' %}aria-current="true"{% endif %}>Overdue</a>
+      </div>
+    </div>
+  </div>
+
+  <div class="tracking-filter-row">
+    <span class="tracking-filter-label" id="search-sort-label">Sort</span>
+    <div class="pill-row"><div class="pill-row-list" role="group" aria-labelledby="search-sort-label">
+      {% for value, label in sort_choices %}
+        <a class="pill-toggle{% if selected_sort == value %} is-active{% endif %}" href="{% filter_url 'sort' value %}"{% if selected_sort == value %} aria-current="true"{% endif %}>{{ label }}</a>
+      {% endfor %}
+    </div></div>
+  </div>
+
+  <div class="tracking-filter-row">
+    <span class="tracking-filter-label" id="search-owner-label">Show</span>
+    <div class="pill-row">
+      <div class="pill-row-list" role="group" aria-labelledby="search-owner-label">
+        {% for value, label in form.owner.field.choices %}
+          <a class="pill-toggle{% if selected_owner == value %} is-active{% endif %}"
+             href="{% filter_url 'owner' value %}"
+             {% if selected_owner == value %}aria-current="true"{% endif %}>{{ label }}</a>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+</div>
+
+</details>

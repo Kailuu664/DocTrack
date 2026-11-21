@@ -1,0 +1,40 @@
+{% comment %}
+  One routing step. Its own file because the detail page renders the list in
+  two halves — the folded older entries and the visible recent ones — and two
+  copies of this markup would drift apart the first time either was edited.
+{% endcomment %}
+<li class="{% if step.is_received %}is-done{% else %}is-pending{% endif %}">
+  <div class="t-title">
+    {{ step.get_action_display }}:
+    {% include "partials/_office_badge.html" with office=step.from_office %}
+    <span aria-hidden="true">→</span>
+    {% include "partials/_office_badge.html" with office=step.to_office %}
+  </div>
+  <div class="t-meta">
+    Sent by {{ step.sent_by.display_name }} · {{ step.sent_at|date:"d M Y, g:i A" }}
+    {% if step.due_at %} · due {{ step.due_at|date:"d M, g:i A" }}{% endif %}
+  </div>
+  {% if step.instructions %}<div class="t-detail">{{ step.instructions }}</div>{% endif %}
+  {% if step.is_received %}
+    <div class="t-meta mt-1 t-received">
+      ✓ Receipt confirmed by {{ step.received_by.display_name }} ({{ step.to_office.code }})
+      · {{ step.received_at|date:"d M Y, g:i A" }}
+    </div>
+    {% if step.receipt_note %}<div class="t-detail">{{ step.receipt_note }}</div>{% endif %}
+    {% comment %}
+      Office time, from analytics.record_waits — the engine and holidays every
+      turnaround figure uses. Calendar time in the tooltip.
+    {% endcomment %}
+    <div class="t-meta t-wait">
+      <span title="{{ step.waits.receipt.calendar }} on the calendar">Confirmed after {{ step.waits.receipt.office }} of office time</span>
+      {% if step.waits.held %}
+        · <span title="{{ step.waits.held.calendar }} on the calendar">{{ step.to_office.code }} held it {{ step.waits.held.office }}{% if step.waits.held.live %} so far{% else %} before {{ step.waits.held_until }}{% endif %}</span>
+      {% endif %}
+    </div>
+  {% else %}
+    <div class="t-meta mt-1 t-awaiting">
+      Awaiting receipt from {{ step.to_office.code }}{% if step.waits.receipt %}
+        · <span title="{{ step.waits.receipt.calendar }} on the calendar">{{ step.waits.receipt.office }} of office time so far</span>{% endif %}
+    </div>
+  {% endif %}
+</li>

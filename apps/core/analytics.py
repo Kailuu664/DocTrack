@@ -1,0 +1,1119 @@
+"""Aggregations shared by the Reports page and the Dashboard.
+
+Everything here was originally a private method on `ReportsView`. The dashboard
+now shows the same figures — overdue by office, the monthly volume series, the
+turnaround averages, the status mix — and a second copy growing inside
+`DashboardView` would drift from the first the moment either page was touched.
+So they live here as plain functions over querysets, and both views call them.
+
+Two rules hold throughout:
+
+* **Nothing writes.** Every function takes a queryset somebody else has already
+  scoped with `visible_to(user)` and returns dictionaries. Scoping is the
+  caller's job precisely so it cannot be forgotten here.
+* **Durations are office hours first.** `business_time` counts them, and
+  `_turnaround_samples` is the one place their intervals are collected; the
+  office-hours figure is the headline everywhere, with calendar time beside
+  it, because that is the
+  distinction Reports already draws — a dashboard that measured the same thing
+  on a different basis would read as a contradiction, not a second view.
+"""
+
+from __future__ import annotations
+
+from datetime import date, datetime, time, timedelta
+from math import cos, pi, sin
+
+from django.db.models import Count, F, OuterRef, Q, Subquery
+from django.db.models.functions import TruncMonth
+from django.urls import reverse
+from django.utils import timezone
+
+from apps.documents.models import COMPLETED_SOURCE
+from apps.tracking.models import ACTIVE_STATUSES, COMPLETED_STATUSES, RoutingStep, Status, overdue_q
+
+from .business_time import (
+    _two_units,
+    business_seconds_between,
+    humanise_business_seconds,
+    load_holidays,
+    office_hours_caveat,
+    office_schedule_explanation,
+    with_office_schedule,
+    working_day_hours,
+    working_day_seconds,
+)
+from .colors import STATUS_COLOURS
+from .processing_time import processing_seconds
+
+#: Months of history the charts cover. A year is the reporting unit offices
+#: actually use, and it keeps every column chart to twelve readable bars.
+REPORT_MONTHS = 12
+
+
+# ---------------------------------------------------------------------------
+# Small shared arithmetic
+# ---------------------------------------------------------------------------
+def percent(part: int, whole: int) -> int:
+    return int(round(100 * part / whole)) if whole else 0
+
+
+def percent_split(counts):
+    """Whole percentage shares whose sum is exactly 100 for a nonempty whole."""
+    total = sum(counts)
+    if not total:
+        return [0] * len(counts)
+    shares = [100 * count // total for count in counts]
+    order = sorted(range(len(counts)), key=lambda i: 100 * counts[i] % total, reverse=True)
+    for index in order[:100 - sum(shares)]:
+        shares[index] += 1
+    return shares
+
+
+def bar(part: int, whole: int) -> int:
+    """Bar width as a percentage. Zero stays zero — a minimum-width stub would
+    paint a value that is not there — but a real value never rounds away.
+
+    `whole` is the total the panel states, never the largest row. A bar track
+    is 100% of something, and measured against the busiest row the leader
+    always filled it: 3 documents of 15 drew a full bar beside the words "20%".
+    """
+    if not part or not whole:
+        return 0
+    return max(1, int(round(100 * part / whole)))
+
+
+def share_text(part: int, whole: int) -> str:
+    """A share as printed beside its bar.
+
+    `percent` rounds, so one document in three hundred printed "0%" beside a
+    bar `bar` had floored at 1% so that it shows: the label and the mark
+    disagreeing about whether anything is there. "<1%" says both. ">99%" is
+    the same guard at the other end, because 999 of 1,000 is not all of them.
+    """
+    if not part or not whole:
+        return "0%"
+    value = percent(part, whole)
+    if value == 0:
+        return "<1%"
+    if value == 100 and part < whole:
+        return ">99%"
+    return f"{value}%"
+
+
+def axis_ticks(ceiling: int, steps: int = 4) -> list[dict]:
+    """Labelled y-axis ticks for a column chart scaled to `ceiling`.
+
+    Round numbers — 0, 50, 100, 150 — then the ceiling itself on top. Round
+    steps rather than exact quarters of the ceiling: quarters of 180 are 45, 90
+    and 135, which a reader has to work at, and quarters of 5 round to 0, 1, 3,
+    4, 5 — gridlines at uneven spacing with a value missing. A round step keeps
+    the lines evenly spaced and the labels easy to read against.
+
+    The step is the smallest of 1, 2, 2.5 and 5 times a power of ten that
+    divides the scale into at most `steps` intervals, and never less than 1: a
+    count has no half-documents. The ceiling is always the top tick, so the
+    axis and "Tallest column = N" never disagree, and a round tick within 10% of
+    it is dropped rather than printed on top of it.
+
+    Each tick carries the height of the value it prints, so a label never sits
+    at a height that is not its value. A zero ceiling is an empty chart: one tick
+    at zero, and no division by it.
+    """
+    if ceiling <= 0:
+        return [{"value": 0, "offset_percent": 0.0}]
+
+    magnitude = 1
+    while True:
+        # 2.5 times a power of ten is only a whole number from 10 upward.
+        multiples = (1, 2, 2.5, 5) if magnitude >= 10 else (1, 2, 5)
+        fitting = [int(m * magnitude) for m in multiples if ceiling // int(m * magnitude) <= steps]
+        if fitting:
+            step = fitting[0]
+            break
+        magnitude *= 10
+
+    values = list(range(0, ceiling, step))
+    if values and values[-1] and (ceiling - values[-1]) * 10 < ceiling:
+        values.pop()
+    values.append(ceiling)
+    return [
+        {"value": value, "offset_percent": round(100 * value / ceiling, 2)}
+        for value in values
+    ]
+
+
+#: The ring, in SVG user units. The same geometry the conic-gradient ring had in
+#: pixels: a 190 box, and a hole inset 46 from its edge. The SVG scales with the
+#: box, so the narrower rings CSS draws below 992px keep these proportions.
+RING_SIZE = 190
+RING_OUTER = 95
+RING_INNER = 49
+
+
+def _ring_point(percent: float, radius: float) -> str:
+    """A point on a circle about the ring's centre, `percent` of the way round
+    clockwise from twelve o'clock: where a conic-gradient starts, and the way
+    it runs."""
+    angle = 2 * pi * percent / 100
+    centre = RING_SIZE / 2
+    x = centre + radius * sin(angle)
+    y = centre - radius * cos(angle)
+    return f"{x:.3f} {y:.3f}"
+
+
+def ring_arc(start: float, end: float) -> str:
+    """SVG path `d` for the ring segment from `start`% to `end`%.
+
+    An annular sector: along the outer circle, in, and back along the inner
+    one. Empty for a segment with no width, which would be a zero-area path
+    nobody can see or point at.
+
+    A segment covering the whole ring is two half-circles on each radius. An
+    SVG arc whose start and end points coincide draws nothing at all, so a ring
+    with a single slice (an office whose every document is pending receipt)
+    would otherwise render as an empty box. Painted with `fill-rule: evenodd`
+    so the inner circle cuts the hole.
+    """
+    span = end - start
+    if span <= 0:
+        return ""
+    outer, inner = RING_OUTER, RING_INNER
+    if span >= 100:
+        top_o, bottom_o = _ring_point(0, outer), _ring_point(50, outer)
+        top_i, bottom_i = _ring_point(0, inner), _ring_point(50, inner)
+        return (
+            f"M {top_o} A {outer} {outer} 0 1 1 {bottom_o} A {outer} {outer} 0 1 1 {top_o} Z "
+            f"M {top_i} A {inner} {inner} 0 1 0 {bottom_i} A {inner} {inner} 0 1 0 {top_i} Z"
+        )
+    large = 1 if span > 50 else 0
+    return (
+        f"M {_ring_point(start, outer)} "
+        f"A {outer} {outer} 0 {large} 1 {_ring_point(end, outer)} "
+        f"L {_ring_point(end, inner)} "
+        f"A {inner} {inner} 0 {large} 0 {_ring_point(start, inner)} Z"
+    )
+
+
+def humanise_duration(delta) -> str:
+    """A timedelta as office language: '2 days 4 hrs', '3 hrs', '18 mins'."""
+    if delta is None:
+        return "—"
+    if delta.total_seconds() < 0:
+        return "—"
+    if delta.total_seconds() == 0:
+        return "0 mins"
+    total = int(delta.total_seconds())
+    if total < 60:
+        return "under a minute"
+    days, remainder = divmod(total, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    return _two_units(days, "day", hours, "hr", minutes, "min")
+
+
+def month_window(months_back: int = REPORT_MONTHS):
+    """The last `months_back` calendar months, plus the datetime they start at.
+
+    Built by walking months rather than subtracting days so February and the
+    31-day months land on the right buckets.
+    """
+    months: list = []
+    cursor = timezone.localdate().replace(day=1)
+    for _ in range(months_back):
+        months.append(cursor)
+        cursor = (cursor - timedelta(days=1)).replace(day=1)
+    months.reverse()
+    since = timezone.make_aware(
+        datetime.combine(months[0], time.min), timezone.get_current_timezone()
+    )
+    return months, since
+
+
+def month_series(queryset, field: str, since):
+    """{month: count} for one date field, so two series can share an axis."""
+    rows = (
+        queryset.filter(**{f"{field}__gte": since})
+        .annotate(month=TruncMonth(field))
+        .values("month")
+        .annotate(total=Count("id", distinct=True))
+        .order_by("month")
+    )
+    return {
+        timezone.localtime(row["month"]).date().replace(day=1): row["total"]
+        for row in rows
+        if row["month"]
+    }
+
+
+def _month_of(value):
+    """The calendar month a stored timestamp belongs to, in local time."""
+    return timezone.localtime(value).date().replace(day=1)
+
+
+# ---------------------------------------------------------------------------
+# Tracking panels
+# ---------------------------------------------------------------------------
+def by_status(records, total: int) -> list[dict]:
+    """One row per status, its bar the share of every document it states.
+
+    Every document is in exactly one stage, so the bars add up to one full
+    track across the rows. `bar_percent` is `percent` with the 1% floor that
+    keeps a single document visible."""
+    field = "stage" if "stage" in records.query.annotations else "status"
+    rows = list(records.order_by().values(field).annotate(total=Count("id", distinct=True)).order_by("-total"))
+    labels = dict(Status.choices)
+    for row in rows:
+        if field != "status":
+            row["status"] = row.pop(field)
+        row["label"] = labels.get(row["status"], row["status"])
+        row["percent"] = percent(row["total"], total)
+        row["bar_percent"] = bar(row["total"], total)
+        row["colour"] = STATUS_COLOURS.get(row["status"], STATUS_COLOURS["DRAFT"])
+    return rows
+
+
+#: Rows a ranked panel shows before the rest collapse into one "Other" line.
+#:
+#: Twelve, not eight. Eight truncated a nine-office university by exactly one,
+#: which is the worst size a cap can be: the reader loses a single row and the
+#: remainder line reads "Other (1 office)", which looks like a bug. Twelve shows
+#: every office today and still keeps the panel bounded if the university grows.
+TOP_N = 12
+
+
+def cap_with_remainder(rows, limit, noun):
+    """Split a ranked list into the rows shown and a label for the rest.
+
+    Returns `(kept, cut, label)`, where `label` is None when nothing was cut.
+
+    A capped list with no tail cannot add up: the bars a reader sums are a
+    subset of the headline they sit under, and nothing on screen says so. Every
+    ranked panel here had that shape, and `overdue_summary["total"]` is counted
+    over the whole queryset — correctly — which is exactly what made the gap
+    visible to anyone who added the rows.
+
+    The caller builds the remainder row itself, because each panel carries
+    different fields and a row missing the ones its template reads is a worse
+    bug than the one this fixes. What lives here is the part that must not
+    differ: where the cut falls and what the leftover is called.
+    """
+    if len(rows) <= limit:
+        return rows, [], None
+    kept, cut = rows[:limit], rows[limit:]
+    return kept, cut, f"Other ({len(cut)} {noun}{'' if len(cut) == 1 else 's'})"
+
+
+def overdue_offices(records, limit: int = TOP_N) -> list[dict]:
+    """Where overdue documents are sitting — a queue to chase, not a total.
+
+    Each row carries how long the *oldest* item in that pile has been late, not
+    just how many there are. A count alone cannot tell an office holding twelve
+    documents one day late apart from an office holding three that have been
+    late for a month, and the second is the one somebody has to go and see.
+
+    `share` is that office's portion of every overdue document, and it is taken
+    over the *whole* grouping before the `limit` slice. Summing the returned
+    rows instead would divide by a truncated total and report shares adding up
+    to 100% across the few offices shown — the same trap `overdue_summary`
+    documents for its own headline figure.
+    """
+    now = timezone.now()
+    late = records.filter(overdue_q()).exclude(current_office__isnull=True)
+    grouped = list(
+        late.values("current_office__code", "current_office__name")
+        .annotate(total=Count("id", distinct=True))
+        .order_by("-total")
+    )
+    everywhere = sum(row["total"] for row in grouped)
+    # Plain slicing, so `limit=0` still returns nothing — that is what the
+    # dashboard's summary test leans on to prove the total survives the cap.
+    rows = grouped[:limit]
+    cut = grouped[limit:]
+
+    # The earliest deadline per office, in one pass over the same queryset,
+    # rather than a query per row.
+    earliest: dict[str, object] = {}
+    for code, due_at in late.values_list("current_office__code", "due_at"):
+        if due_at is None:
+            continue
+        if code not in earliest or due_at < earliest[code]:
+            earliest[code] = due_at
+
+    for row in rows:
+        code = row["current_office__code"]
+        row["code"] = code
+        row["name"] = row["current_office__name"] or code
+        # `share` is the reportable figure — this office's portion of every
+        # overdue document there is. `percent` and `bar_percent` are the bar
+        # drawn at that share, floored at 1% so a single document shows.
+        row["share"] = percent(row["total"], everywhere)
+        row["percent"] = row["bar_percent"] = bar(row["total"], everywhere)
+        due_at = earliest.get(code)
+        # Whole days late, floored: "3 days" must mean the deadline is three
+        # full days behind, never "some part of a third day".
+        row["oldest_days"] = max(0, (now - due_at).days) if due_at else 0
+
+    # The tail, as a row. Without it the office lines never sum to the headline
+    # they sit under, and `overdue_summary["total"]` is counted over the whole
+    # queryset, so the gap is visible to anybody who adds them up. Its bar is
+    # drawn like the others: its share of the whole is as real as theirs.
+    if cut:
+        # Read from `earliest`, because the loop above enriches only the kept
+        # rows — a cut row has no `oldest_days` of its own to take a max over.
+        cut_dues = [
+            earliest[row["current_office__code"]]
+            for row in cut
+            if row["current_office__code"] in earliest
+        ]
+        cut_total = sum(row["total"] for row in cut)
+        rows.append(
+            {
+                "code": "",
+                "name": f"Other ({len(cut)} office{'' if len(cut) == 1 else 's'})",
+                "office_count": len(cut),
+                "total": cut_total,
+                "percent": bar(cut_total, everywhere),
+                "bar_percent": bar(cut_total, everywhere),
+                "share": percent(cut_total, everywhere),
+                "oldest_days": max(
+                    (max(0, (now - due).days) for due in cut_dues), default=0
+                ),
+                "is_remainder": True,
+            }
+        )
+    return rows
+
+
+def overdue_summary(records, rows: list[dict], total_documents: int) -> dict:
+    """The headline figures above the per-office list.
+
+    `total` is counted over the whole queryset rather than summed from `rows`,
+    which are capped at the longest few queues — summing a truncated list would
+    quietly under-report the thing the banner exists to state.
+    """
+    total = (
+        records.filter(overdue_q())
+        .distinct()
+        .count()
+    )
+    return {
+        "total": total,
+        "oldest_days": max([row["oldest_days"] for row in rows], default=0),
+        "percent_of_all": percent(total, total_documents),
+        "office_count": sum(row.get("office_count", 1) for row in rows if row["total"]),
+    }
+
+
+#: The series the chart draws, in order, with the colour class each is painted
+#: in. Endorsements count routing steps where the other two count documents — one
+#: document endorsed four times is four endorsements — so that column runs above
+#: the others and usually sets the scale. Every column carries its own number,
+#: and the legend and the note say which unit each counts, because a reader who
+#: can see all three needs to know that one of them is not documents.
+VOLUME_SERIES = (
+    # The colour class suffix, named for the meaning: Completed is the
+    # Completed-status green everywhere, endorsements the Pending receipt amber of
+    # a document between offices. Completed was gold on this chart and
+    # endorsements green, the reverse of every other page.
+    ("Created", "created", "created"),
+    ("Endorsements", "transferred", "endorsement"),
+    ("Completed", "completed", "completed"),
+)
+
+
+def monthly_volume(records) -> dict:
+    """Created, transferred-or-endorsed and completed — cumulative.
+
+    Each series accumulates from the start of the visible tracking history.
+    These totals are activity measures, not a backlog or repository count.
+    Use the live tracking queues to determine what currently needs action.
+
+    Transferred-or-endorsed counts routing steps rather than records, since one
+    document endorsed onward four times is four transfers of work.
+
+    The running totals start from *all* history, not from the window, so the
+    first bar is the true position in that month and not a fresh zero.
+    """
+    months, since = month_window()
+    completed_records = records.filter(status__in=COMPLETED_STATUSES)
+    steps = RoutingStep.objects.filter(record__in=records)
+
+    created = month_series(records, "created_at", since)
+    finished = month_series(completed_records, "completed_at", since)
+    transferred = month_series(steps, "sent_at", since)
+
+    # Everything before the window, so the curves begin where they really are.
+    opening = {
+        "created": records.filter(created_at__lt=since).count(),
+        "transferred": steps.filter(sent_at__lt=since).count(),
+        "completed": completed_records.filter(completed_at__lt=since).count(),
+    }
+
+    rows = []
+    running = dict(opening)
+    for month in months:
+        running["created"] += created.get(month, 0)
+        running["transferred"] += transferred.get(month, 0)
+        running["completed"] += finished.get(month, 0)
+        rows.append(
+            {
+                "month": month,
+                "created": running["created"],
+                "transferred": running["transferred"],
+                "completed": running["completed"],
+                # This month's own additions, kept for the tooltip: a cumulative
+                # curve alone cannot say what changed in March.
+                "created_delta": created.get(month, 0),
+                "transferred_delta": transferred.get(month, 0),
+                "completed_delta": finished.get(month, 0),
+            }
+        )
+
+    # Over every plotted series, so no column can be drawn above the plot.
+    ceiling = max(
+        [max(row[key] for _, key, _ in VOLUME_SERIES) for row in rows] + [0]
+    )
+    for row in rows:
+        # Every column carries its own value, above its own bar. One number per
+        # month said nothing about the two columns it did not sit on, and which
+        # column it sat on changed with the data.
+        row["columns"] = [
+            {
+                "label": label,
+                "series": colour,
+                "value": row[key],
+                "percent": bar(row[key], ceiling),
+            }
+            for label, key, colour in VOLUME_SERIES
+        ]
+        # A month with nothing in any series draws nothing and says nothing: the
+        # axis already reads 0. A month with something in it names every series,
+        # a zero included, so a series is never missing without explanation.
+        row["has_values"] = any(column["value"] for column in row["columns"])
+
+    return {
+        "rows": rows,
+        "ceiling": ceiling,
+        "ticks": axis_ticks(ceiling),
+        "total": rows[-1]["created"] if rows else 0,
+        "outstanding": (rows[-1]["created"] - rows[-1]["completed"]) if rows else 0,
+    }
+
+
+#: The three stages every turnaround figure is reported in, in order: the key,
+#: what the stage is called, what it measures, and the thing it is counted in.
+TURNAROUND_STAGES = (
+    ("receipt", Status.PENDING_RECEIPT.label, "sent → confirmed", "endorsement"),
+    ("processing", Status.IN_PROCESS.label, "first receipt → completed, excluding receipt waits", "document"),
+    ("lifetime", "Total lifetime", "created → completed", "document"),
+)
+
+
+def _turnaround_samples(records, since=None, until=None, holidays=None, *, now=None) -> dict:
+    """Every interval a turnaround figure is taken over, one list per stage.
+
+    The one place these are collected, so the monthly trend, the month's
+    summary, Reports and the memo cannot count a different set. Two queries,
+    whatever the period.
+
+    Bucketed by when the *work finished*: an endorsement by when it was confirmed,
+    a document by when it was completed, so a period's figure covers work
+    actually closed in it. Completion rather than approval, because the wait
+    for an administrator is somebody else's queue.
+
+    Each sample carries the record it belongs to, so the fastest and slowest can
+    name it, and `ended` so a tie can be broken by who finished first.
+    """
+    if holidays is None:
+        holidays = load_holidays()
+    now = now or timezone.now()
+
+    # Future-dated events cannot contribute to a report of work already done.
+    # Use the same cutoff for the month's summary and both trend charts.
+    # Correlate the already-scoped cohort by record ID. Taking one match handles
+    # duplicate rows from visibility/filter joins without rescanning the whole
+    # cohort for every endorsement when PostgreSQL has stale row estimates. Read
+    # the number in that same lookup so the outer query needs no record join.
+    visible_number = records.filter(pk=OuterRef("record_id")).order_by().values("tracking_number")[:1]
+    steps = RoutingStep.objects.annotate(
+        turnaround_tracking_number=Subquery(visible_number)
+    ).filter(turnaround_tracking_number__isnull=False)
+    done = records.filter(status__in=COMPLETED_STATUSES, completed_at__lte=now)
+    receipt_period = Q(received_at__lte=now)
+    if since is not None:
+        receipt_period &= Q(received_at__gte=since)
+        done = done.filter(completed_at__gte=since)
+    if until is not None:
+        receipt_period &= Q(received_at__lt=until)
+        done = done.filter(completed_at__lt=until)
+    completed_rows = list(done.order_by().values_list(
+        "pk", "tracking_number", "created_at", "first_received_at", "completed_at", "due_at",
+    ).distinct())
+    completed_ids = {row[0] for row in completed_rows}
+    history = {record_id: [] for record_id in completed_ids}
+
+    samples = {key: [] for key, *_ in TURNAROUND_STAGES}
+    excluded = {key: 0 for key, *_ in TURNAROUND_STAGES}
+    deadlines = []
+
+    def sample(start, end, record_id, tracking_number, *, measured=None):
+        office, calendar = measured if measured is not None else (
+            business_seconds_between(start, end, holidays), max(0.0, (end - start).total_seconds()),
+        )
+        return {
+            "office": office,
+            "calendar": calendar,
+            "ended": end,
+            "month": _month_of(end),
+            "record_id": record_id,
+            "tracking_number": tracking_number,
+        }
+
+    # One grouped read supplies both receipt samples in this period and the
+    # complete routing history for documents completed in it. Earlier waits
+    # must still pause processing even if their confirmations were last month.
+    for sent_at, received_at, batch, record_id, number in steps.filter(
+        receipt_period | Q(record_id__in=completed_ids),
+    ).order_by().values_list(
+        "sent_at", "received_at", "batch", "record_id", "turnaround_tracking_number"
+    ):
+        if record_id in history:
+            history[record_id].append((batch, sent_at, received_at))
+        if received_at is None or received_at > now or (since is not None and received_at < since) or (
+            until is not None and received_at >= until
+        ):
+            continue
+        if sent_at and received_at >= sent_at:
+            samples["receipt"].append(sample(sent_at, received_at, record_id, number))
+        else:
+            excluded["receipt"] += 1
+
+    for record_id, number, created_at, first_received_at, completed_at, due_at in completed_rows:
+        if completed_at >= created_at:
+            samples["lifetime"].append(sample(created_at, completed_at, record_id, number))
+        else:
+            excluded["lifetime"] += 1
+        if first_received_at and created_at <= first_received_at <= completed_at:
+            samples["processing"].append(sample(
+                first_received_at, completed_at, record_id, number,
+                measured=processing_seconds(first_received_at, completed_at, history[record_id], holidays),
+            ))
+        else:
+            excluded["processing"] += 1
+        if due_at and completed_at >= created_at:
+            deadlines.append((_month_of(completed_at), completed_at <= due_at))
+
+    return {"samples": samples, "deadlines": deadlines, "excluded": excluded}
+
+
+def _mean(values):
+    return sum(values) / len(values) if values else None
+
+
+def _sample_counts(samples) -> dict:
+    """The denominator and its distinct documents, including genuine zeros.
+
+    Receipt is measured per endorsement, not per document. An instant confirmation
+    also has zero working time, but is not an interval outside office hours.
+    """
+    return {
+        "samples": len(samples),
+        "documents": len({sample["record_id"] for sample in samples}),
+        "zero_working_time": sum(sample["office"] == 0 for sample in samples),
+        "outside_office_hours": sum(
+            sample["office"] == 0 and sample["calendar"] > 0 for sample in samples
+        ),
+        "instantaneous": sum(sample["calendar"] == 0 for sample in samples),
+    }
+
+
+def _turnaround_row(key, samples, day_seconds) -> dict:
+    """A chart point and its readable durations use the same sample population."""
+    office = _mean([sample["office"] for sample in samples])
+    calendar = _mean([sample["calendar"] for sample in samples])
+    return {
+        # Keep precision until SVG geometry is drawn. Rounding to tenths of a
+        # working day hid every positive average below 24 minutes as zero.
+        key: None if office is None else office / day_seconds,
+        f"{key}_office_seconds": office,
+        f"{key}_calendar_seconds": calendar,
+        f"{key}_label": humanise_business_seconds(office),
+        f"{key}_calendar": humanise_duration(
+            None if calendar is None else timedelta(seconds=calendar)
+        ),
+        **{f"{key}_{name}": value for name, value in _sample_counts(samples).items()},
+    }
+
+
+def _named(sample) -> dict:
+    """A fastest or slowest sample, in the words and link a reader needs."""
+    return {
+        "office_label": humanise_business_seconds(sample["office"]),
+        "calendar_label": humanise_duration(timedelta(seconds=sample["calendar"])),
+        "office_seconds": sample["office"],
+        "calendar_seconds": sample["calendar"],
+        "tracking_number": sample["tracking_number"],
+        "url": reverse("tracking:detail", args=[sample["record_id"]]),
+    }
+
+
+def _stage(key, label, measures, noun, samples) -> dict:
+    """Average, fastest and slowest for one stage.
+
+    Fastest leaves out the intervals that fell entirely outside office hours: an
+    endorsement sent and confirmed on a Saturday took no office time, and would be
+    "fastest" every month without saying anything about anybody's speed. They
+    still count in the average, which is what they did before this existed, and
+    `zero_working_time` says how many there were, including instant confirmations.
+
+    Ties go to whoever finished first, then to the lower tracking number, so the
+    same data always names the same document.
+    """
+    timed = [s for s in samples if s["office"] > 0]
+    fastest = min(timed, key=lambda s: (s["office"], s["ended"], s["tracking_number"]), default=None)
+    slowest = min(samples, key=lambda s: (-s["office"], s["ended"], s["tracking_number"]), default=None)
+    office = _mean([s["office"] for s in samples])
+    calendar = _mean([s["calendar"] for s in samples])
+    return {
+        "key": key,
+        "label": label,
+        "measures": measures,
+        "noun": noun,
+        **_sample_counts(samples),
+        "average_seconds": office,
+        "average_calendar_seconds": calendar,
+        "average_outside_seconds": None if calendar is None else calendar - office,
+        "total_office_seconds": sum(s["office"] for s in samples),
+        "average_label": humanise_business_seconds(office),
+        "average_calendar": humanise_duration(None if calendar is None else timedelta(seconds=calendar)),
+        "fastest": _named(fastest) if fastest else None,
+        "slowest": _named(slowest) if slowest else None,
+    }
+
+
+def _month_bounds(month):
+    """The first instant of `month` and of the month after it, local time."""
+    tz = timezone.get_current_timezone()
+    following = (month.replace(day=28) + timedelta(days=4)).replace(day=1)
+    return (
+        timezone.make_aware(datetime.combine(month, time.min), tz),
+        timezone.make_aware(datetime.combine(following, time.min), tz),
+    )
+
+
+@with_office_schedule
+def turnaround(records, month=None, *, now=None) -> dict:
+    """Turnaround for one period: every stage's average, fastest and slowest.
+
+    `month` is the first day of a calendar month; None is every month there is.
+    The dashboard, Reports and the memo all call this for the month the reader
+    picked, so a figure that appears on two of them is the same figure.
+
+    Each duration is reported twice: in office hours, and on the calendar.
+    Neither replaces the other. Office hours answer "how much working time did
+    the office have to act", which is the fair way to judge an office; calendar
+    time is what the requester actually waited, which is the fair way to answer
+    them.
+    """
+    since, until = _month_bounds(month) if month else (None, None)
+    now = now or timezone.now()
+    collected = _turnaround_samples(records, since, until, now=now)
+    stages = [
+        _stage(key, label, measures, noun, collected["samples"][key])
+        for key, label, measures, noun in TURNAROUND_STAGES
+    ]
+    for stage in stages:
+        stage["excluded"] = collected["excluded"][stage["key"]]
+    closed = len(collected["deadlines"])
+    on_time = sum(1 for _month, kept in collected["deadlines"] if kept)
+    pending_records = records.filter(**{
+        "stage" if "stage" in records.query.annotations else "status": Status.PENDING_RECEIPT,
+    }).values("pk")
+    waiting = RoutingStep.objects.filter(
+        record__in=records, received_at__isnull=True,
+        batch=F("record__current_batch"), sent_at__lte=now,
+    ).exclude(record__status__in=COMPLETED_STATUSES).aggregate(
+        endorsements=Count("pk"), documents=Count("record_id", distinct=True),
+        pending_documents=Count("record_id", filter=Q(record_id__in=pending_records), distinct=True),
+    )
+
+    result = {
+        "month": month,
+        # "So far" and "yet" belong to the month still running; a past month is
+        # finished, and "none completed yet" would promise work that never came.
+        "is_current": month == timezone.localdate(now).replace(day=1),
+        "as_of": now,
+        "stages": stages,
+        "office_schedule": office_schedule_explanation(),
+        "office_hours_caveat": office_hours_caveat(),
+        "working_day_hours": working_day_hours(),
+        "on_time": on_time,
+        "on_time_total": closed,
+        "on_time_percent": percent(on_time, closed),
+        # A period with nothing due has no rate. 0% would read as "everything
+        # was late" when the truth is "nothing was owed".
+        "has_on_time": bool(closed),
+        # Endorsements the receipt average cannot include yet: sent in the batch
+        # the document is on now, not yet confirmed, on a document still in
+        # circulation. It counted every unconfirmed step ever written, which
+        # included siblings on finished documents and hops the document had
+        # already moved past — 83 on the seeded data, beside a Pending receipt
+        # card reading 20. None of those will ever be confirmed. Live, not
+        # of the period: it is what is waiting now.
+        "awaiting_confirmation": waiting["endorsements"],
+        "awaiting_confirmation_documents": waiting["documents"],
+        "awaiting_confirmation_pending_documents": waiting["pending_documents"],
+        "awaiting_confirmation_other_documents": waiting["documents"] - waiting["pending_documents"],
+    }
+    # The flat names the pages have always read: office-hours average, its
+    # calendar twin, and how many it is taken over — so "4 hrs" from three
+    # documents is not read with the weight of "4 hrs" from three hundred.
+    for stage in stages:
+        result[stage["key"]] = stage["average_label"]
+        result[f"{stage['key']}_calendar"] = stage["average_calendar"]
+        result[f"{stage['key']}_samples"] = stage["samples"]
+    return result
+
+
+def _duration(start, end, holidays, live=False) -> dict:
+    """One interval as the timeline and export state it: office time first."""
+    if start is None or end is None or end < start:
+        return None
+    office = business_seconds_between(start, end, holidays)
+    return {
+        "office_seconds": office,
+        "office": humanise_business_seconds(office),
+        "calendar": humanise_duration(end - start),
+        # Still running: measured up to now, and said to be "so far".
+        "live": live,
+    }
+
+
+@with_office_schedule
+def record_waits(record, steps, holidays=None, now=None) -> dict:
+    """Office time at each hop of one record, keyed by routing step.
+
+    `receipt` is sent to confirmed — or sent to now, "so far", while nobody
+    has confirmed. `held` is how long the receiving office kept it: confirmed
+    to the next time that office sent it on, or to completion when that office
+    finished it, or to now while it still has it. None when the office did
+    neither, such as a copy one recipient of a batch confirmed while another
+    carried the work on.
+
+    Counted by the same engine, holidays and lunch as every turnaround figure,
+    so a hop's wait on this page adds up the same way the averages do.
+    """
+    if holidays is None:
+        holidays = load_holidays()
+    now = now or timezone.now()
+    finished = record.status in COMPLETED_STATUSES and record.completed_at
+    waits = {}
+    for step in steps:
+        entry = {"receipt": None, "held": None, "held_until": None}
+        if step.received_at:
+            entry["receipt"] = _duration(step.sent_at, step.received_at, holidays)
+            passed_on = min(
+                (
+                    later.sent_at for later in steps
+                    if later.from_office_id == step.to_office_id and later.sent_at >= step.received_at
+                ),
+                default=None,
+            )
+            if passed_on:
+                entry["held"] = _duration(step.received_at, passed_on, holidays)
+                entry["held_until"] = "sending it on"
+            elif record.current_office_id == step.to_office_id:
+                if finished and record.completed_at >= step.received_at:
+                    entry["held"] = _duration(step.received_at, record.completed_at, holidays)
+                    entry["held_until"] = "completing it"
+                elif not finished and step.batch == record.current_batch:
+                    entry["held"] = _duration(step.received_at, now, holidays, live=True)
+        elif not finished and step.batch == record.current_batch:
+            entry["receipt"] = _duration(step.sent_at, now, holidays, live=True)
+        waits[step.pk] = entry
+    return waits
+
+
+@with_office_schedule
+def record_durations(record, steps, holidays=None, *, now=None) -> dict:
+    """The three stages for one record, in office seconds, None where the
+    stage has not happened: the per-record twin of `turnaround()`, by the same
+    definitions, for the export.
+
+    Receipt is every confirmed hop's wait added together — the time the record
+    spent waiting for somebody to sign for it.
+    """
+    if holidays is None:
+        holidays = load_holidays()
+    now = now or timezone.now()
+    steps = list(steps)
+    finished = (
+        record.status in COMPLETED_STATUSES and record.completed_at
+        and record.created_at <= record.completed_at <= now
+    )
+    received = [step for step in steps if step.sent_at and step.received_at
+                and step.sent_at <= step.received_at <= now]
+    return {
+        "receipt": (
+            sum(business_seconds_between(s.sent_at, s.received_at, holidays) for s in received)
+            if received else None
+        ),
+        "processing": (
+            processing_seconds(
+                record.first_received_at, record.completed_at,
+                ((step.batch, step.sent_at, step.received_at) for step in steps), holidays,
+            )[0]
+            if finished and record.first_received_at
+            and record.created_at <= record.first_received_at <= record.completed_at else None
+        ),
+        "lifetime": (
+            business_seconds_between(record.created_at, record.completed_at, holidays)
+            if finished else None
+        ),
+    }
+
+
+@with_office_schedule
+def turnaround_by_month(records, months_back: int = REPORT_MONTHS, *, year=None, now=None) -> dict:
+    """The three turnaround averages, one point per month.
+
+    `turnaround()` answers for one period, which cannot show whether an office
+    is getting faster or slower — and that is the entire question a trend line
+    exists to answer. Both are built from `_turnaround_samples`, so a month's
+    point on this chart and that month's `turnaround()` are the same figure.
+    """
+    months, since = month_window(months_back)
+    until = None
+    if year is not None:
+        months = [date(year, month, 1) for month in range(1, 13)]
+        since = timezone.make_aware(datetime(year, 1, 1))
+        until = timezone.make_aware(datetime(year + 1, 1, 1))
+    collected = _turnaround_samples(records, since=since, until=until, now=now)
+
+    buckets = {month: {key: [] for key, *_ in TURNAROUND_STAGES} for month in months}
+    for key, samples in collected["samples"].items():
+        for sample in samples:
+            if sample["month"] in buckets:
+                buckets[sample["month"]][key].append(sample)
+    deadlines = {month: [0, 0] for month in months}
+    for month, kept in collected["deadlines"]:
+        if month in deadlines:
+            deadlines[month][0] += 1
+            deadlines[month][1] += int(kept)
+
+    day = working_day_seconds()
+    rows = []
+    for month in months:
+        closed, on_time = deadlines[month]
+        row = {"month": month}
+        for key, *_ in TURNAROUND_STAGES:
+            row.update(_turnaround_row(key, buckets[month][key], day))
+        row.update(
+            {
+                "on_time": on_time,
+                "closed": closed,
+                "on_time_percent": percent(on_time, closed),
+                # A month with nothing due has no rate. 0% would read as
+                # "everything was late" when the truth is "nothing was owed".
+                "has_on_time": bool(closed),
+            }
+        )
+        rows.append(row)
+
+    measured = [
+        value
+        for row in rows
+        for value in (row["receipt"], row["processing"], row["lifetime"])
+        if value is not None
+    ]
+    # Rounded up to a whole day so axis labels are whole days, and never zero —
+    # a zero-height axis has nothing to plot against.
+    ceiling = max(1, int(max(measured, default=0)) + 1) if measured else 1
+
+    return {
+        "rows": rows,
+        "ceiling": ceiling,
+        "ticks": axis_ticks(ceiling),
+        "has_data": bool(measured),
+        "office_hours_caveat": office_hours_caveat(),
+        "latest": rows[-1] if rows else None,
+        "working_day_hours": working_day_hours(),
+    }
+
+
+@with_office_schedule
+def turnaround_by_day(records, month, *, now=None) -> dict:
+    """Daily averages in one month, using the summary's exact sample population."""
+    since = timezone.make_aware(datetime.combine(month, time.min))
+    next_month = (month.replace(day=28) + timedelta(days=4)).replace(day=1)
+    until = timezone.make_aware(datetime.combine(next_month, time.min))
+    now = now or timezone.now()
+    collected = _turnaround_samples(records, since=since, until=until, now=now)
+    last = min(next_month - timedelta(days=1), timezone.localdate(now))
+    days = [month + timedelta(days=i) for i in range(max(0, (last - month).days + 1))]
+    buckets = {day: {key: [] for key, *_ in TURNAROUND_STAGES} for day in days}
+    for key, samples in collected["samples"].items():
+        for sample in samples:
+            day = timezone.localdate(sample["ended"])
+            if day in buckets:
+                buckets[day][key].append(sample)
+    rows = []
+    day_seconds = working_day_seconds()
+    for day, stages in buckets.items():
+        row = {"month": day, "period_label": day.strftime("%d %B %Y"),
+               "axis_label": str(day.day) if day.day == 1 or day.day % 5 == 0 or day == last else ""}
+        for key, samples in stages.items():
+            row.update(_turnaround_row(key, samples, day_seconds))
+        rows.append(row)
+    measured = [row[key] for row in rows for key, *_ in TURNAROUND_STAGES if row[key] is not None]
+    ceiling = max(1, int(max(measured, default=0)) + 1)
+    return {"rows": rows, "latest": rows[-1] if rows else None, "ceiling": ceiling,
+            "ticks": axis_ticks(ceiling), "has_data": bool(measured), "daily": True,
+            "office_hours_caveat": office_hours_caveat(), "working_day_hours": working_day_hours()}
+
+
+def uploads_by_office(documents, records, limit: int = TOP_N) -> dict:
+    """Count active repository documents added this month, once each.
+
+    Completion is not filing. The records argument remains for callers but
+    contributes no repository counts. Both sources use the same population.
+    """
+    current_month = timezone.localdate().replace(day=1)
+    since, until = _month_bounds(current_month)
+    grouped = (
+        documents.filter(is_active=True, created_at__gte=since, created_at__lt=until)
+        .order_by().values("office__code", "office__name")
+        .annotate(total=Count("pk", distinct=True),
+                  filed=Count("pk", filter=Q(source=COMPLETED_SOURCE), distinct=True))
+    )
+    rows = [
+        {"code": row["office__code"], "name": row["office__name"],
+         "total": row["total"], "filed": row["filed"],
+         "uploaded": row["total"] - row["filed"]}
+        for row in grouped
+    ]
+    # Name as the tiebreak so a redeploy cannot reorder equal rows; ascending
+    # by name within a descending sort, hence the two-pass ordering.
+    rows.sort(key=lambda row: row["name"])
+    rows.sort(key=lambda row: row["total"], reverse=True)
+
+    # Before the slice, like `overdue_offices` forty lines up, and for the
+    # reason its docstring gives: summing the rows that survive a top-N divides
+    # by a truncated total, so the offices shown add to 100% and the ones cut
+    # off have vanished from the denominator. Here it was worse than a wrong
+    # percentage — `grand_total` is returned as `total`, so the panel's own
+    # headline was truncated too and contradicted `total_documents`.
+    grand_total = sum(row["total"] for row in rows)
+    rows, cut, remainder_label = cap_with_remainder(rows, limit, "office")
+
+    # Each bar is the share of `grand_total` printed beside it. Scaled to the
+    # busiest office instead, the leader always drew a full track, so an office
+    # with 3 of 15 filled the card next to the words "20%".
+    for row in rows:
+        row["bar_percent"] = bar(row["total"], grand_total)
+        row["percent"] = percent(row["total"], grand_total)
+
+    # The tail, so the rows add up to `total` rather than to a subset of it,
+    # with its bar drawn at its share like every other row.
+    if cut:
+        cut_total = sum(row["total"] for row in cut)
+        rows.append(
+            {
+                "code": "",
+                "name": remainder_label,
+                "uploaded": sum(row["uploaded"] for row in cut),
+                "filed": sum(row["filed"] for row in cut),
+                "total": cut_total,
+                "bar_percent": bar(cut_total, grand_total),
+                "percent": percent(cut_total, grand_total),
+                "is_remainder": True,
+            }
+        )
+
+    for row, share in zip(rows, percent_split([row["total"] for row in rows]), strict=True):
+        row["percent"] = share
+        row["bar_percent"] = 100 * row["total"] / grand_total if grand_total else 0
+
+    # Named only when one office is genuinely ahead. Calling a tie "the top
+    # office" hands out a distinction the numbers did not award.
+    #
+    # Over the real offices only. "Other" is several offices added together, so
+    # comparing first place against it would decide the leadership on how many
+    # offices fell outside the cap, and with a cap of zero it would hand the
+    # distinction to the remainder row itself.
+    ranked = [row for row in rows if not row.get("is_remainder")]
+    leader = None
+    if ranked and (len(ranked) == 1 or ranked[0]["total"] > ranked[1]["total"]):
+        leader = ranked[0]
+
+    return {
+        "rows": rows,
+        "month": current_month,
+        "total": grand_total,
+        "leader": leader,
+    }
+
+
+def combined_totals(records, documents) -> dict:
+    """One whole, split across tracking and the repository.
+
+    The tracking slices are statuses, and statuses are mutually exclusive by
+    construction, so the ring is a partition without anything having to exclude
+    anything else. That was not true while Overdue sat among them: it is a
+    deadline condition lying across all three live stages — on the demo data 10
+    pending-receipt and 15 in-process records were also overdue — so the ring
+    reported 109 slice entries over 44 records while still drawing a closed
+    circle, because the percentages are normalised to their own sum. Overdue is
+    a stat card now, which is where a cross-cutting condition belongs.
+
+    Counted over ACTIVE_STATUSES minus drafts, so each slice equals the rows
+    behind `?status=`. The docstring claimed drafts were excluded while the
+    filter it named included them, so the ring ran one short of the page it
+    describes without anything saying why.
+
+    Excluded rather than given a slice of their own, because a draft is visible
+    only to its author: a Draft slice would make the ring mean something
+    different for every viewer of the same data. The ring is therefore
+    documents *in circulation*, which is what the caption now says.
+
+    The caller supplies the office stage annotation used by its Tracking links.
+    A recipient that has not confirmed stays Pending Receipt even when another
+    recipient has started work. With no office, each document has one aggregate
+    stage and remains Pending Receipt until all current recipients confirm.
+    """
+    field = "stage" if "stage" in records.query.annotations else "status"
+    live = records.filter(**{f"{field}__in": ACTIVE_STATUSES}).exclude(**{field: Status.DRAFT})
+
+    def by_status(status):
+        return live.filter(**{field: status}).distinct().count()
+
+    repository_total = documents.distinct().count()
+    # Everything that did not come out of tracking. It tested `source == UPLOAD`,
+    # which left a scanned document counted Completed here while the repository
+    # tile beside it read Historical — see documents.models.COMPLETED_SOURCE.
+    historical = documents.exclude(source=COMPLETED_SOURCE).distinct().count()
+
+    return {
+        "pending_receipt": by_status(Status.PENDING_RECEIPT),
+        "received": by_status(Status.RECEIVED),
+        "in_process": by_status(Status.IN_PROCESS),
+        "pending_upload": by_status(Status.COMPLETED_PENDING_UPLOAD),
+        # Not a slice; the stat card and the memo both read it from here.
+        "overdue": records.filter(overdue_q()).distinct().count(),
+        "historical": historical,
+        "completed": repository_total - historical,
+    }
+
+
+def live_records_by_status(records) -> list[dict]:
+    """Records still in play, by status.
+
+    Overdue is deliberately absent: it is a deadline condition sitting on top of
+    these statuses, not a status of its own, and it already has the whole banner
+    at the top of the dashboard. Counting it here as well would move records out
+    of the status they are actually in and understate the live queue.
+    """
+    live = records.exclude(status=Status.COMPLETED)
+    total = live.distinct().count()
+    return by_status(live, total)

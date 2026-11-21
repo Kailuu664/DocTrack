@@ -1,0 +1,148 @@
+"""Real Django/CSRF/HTMX/browser audit, opt-in because it needs Chromium/Node."""
+
+import json
+import os
+import re
+import subprocess
+from pathlib import Path
+from threading import Timer
+
+import pytest
+from django.core import mail
+from django.core.files.uploadedfile import SimpleUploadedFile
+from django.core.management import call_command
+from django.utils import timezone
+
+from apps.documents.models import AccessLevel, Collection, Document, DocumentFile
+from apps.tracking import external_services
+from apps.tracking.models import ExternalTrackingRecord, Status, TrackingRecord
+from apps.tracking.services import add_remark, confirm_receipt, create_draft_record, route_record
+from tests.auth_helpers import prepare_verified_user
+
+pytestmark = [pytest.mark.django_db(transaction=True), pytest.mark.skipif(
+    os.environ.get("RUN_LIVE_BROWSER_AUDIT") != "1", reason="Opt-in live Chromium audit; run documented command.",
+)]
+
+
+@pytest.mark.parametrize("phase", ["core", "tail"])
+def test_real_browser_filters_workflows_and_responsive_views(live_server, users, offices, settings, tmp_path, memo_type, tag_urgent, phase):
+    settings.MEDIA_ROOT = tmp_path / "files"
+    settings.ENABLE_BACKGROUND_TASKS = False
+    settings.SECURE_SSL_REDIRECT = False
+    settings.SESSION_COOKIE_SECURE = False
+    settings.CSRF_COOKIE_SECURE = False
+    settings.CSRF_TRUSTED_ORIGINS = [live_server.url]
+    settings.ALLOWED_HOSTS = ["localhost", "127.0.0.1", "testserver"]
+    settings.EMAIL_OTP_REQUIRED = True
+    settings.EMAIL_BACKEND = 'django.core.mail.backends.locmem.EmailBackend'
+    settings.EMAIL_CONFIGURED = True
+    for user in users.values():
+        prepare_verified_user(user)
+    call_command("init_db", verbosity=0)
+    seeded = {}
+    for name in ("Pending", "Received", "Processing"):
+        record = create_draft_record(user=users["sup"], subject=f"Browser {name}", instructions="Review this paper", document_type=memo_type)
+        route_record(record, [offices["MED"]], user=users["sup"])
+        if name != "Pending":
+            confirm_receipt(record, user=users["med"])
+        if name == "Processing":
+            add_remark(record, user=users["med"], remark="Work started")
+        seeded[name] = record.pk
+    outgoing = create_draft_record(user=users["med"], subject="Browser Outgoing", instructions="Review this paper")
+    route_record(outgoing, [offices["SUP"]], user=users["med"])
+    repository_alpha = None
+    repository_reference = "DFNSEALPHA830241"
+    for title, office, collection in (
+        ("Browser Repository Alpha", "MED", Collection.OVPA),
+        ("Browser Repository Beta", "SUP", Collection.OVPA),
+        ("Browser External Alpha", "MED", Collection.EXTERNAL),
+    ):
+        document = Document.objects.create(
+            title=title, year=timezone.localdate().year, office=offices[office], uploaded_by=users["med"],
+            collection=collection, access_level=AccessLevel.OVPA, ocr_status="SKIPPED",
+            document_type=memo_type, document_date=timezone.localdate(),
+            allow_external_ocr=False,
+            reference_number=repository_reference if title == "Browser Repository Alpha" else "",
+        )
+        document.document_types.add(memo_type)
+        document.tags.add(tag_urgent)
+        DocumentFile.objects.create(
+            document=document, file=SimpleUploadedFile("evidence.txt", b"Private browser audit file"),
+            original_name="evidence.txt",
+        )
+        document.rebuild_index()
+        if title == "Browser Repository Alpha":
+            repository_alpha = document.pk
+    # Enough visible rows to exercise real pagination, with usable type/tag/date controls.
+    for index in range(27):
+        document = Document.objects.create(
+            title=f"Browser Page {index:02d}", year=timezone.localdate().year,
+            office=offices["MED"], uploaded_by=users["med"], collection=Collection.OVPA,
+            access_level=AccessLevel.OVPA, ocr_status="SKIPPED", allow_external_ocr=False,
+            document_type=memo_type, document_date=timezone.localdate(),
+        )
+        document.document_types.add(memo_type)
+        document.tags.add(tag_urgent)
+        document.rebuild_index()
+    counterpart = external_services.create_external_office(user=users["med_admin"], name="Browser Registrar", code="BR")
+    external = external_services.create_record(
+        user=users["med_admin"], title="Browser external journey", from_external_office=counterpart,
+    )
+    external_services.add_attachment(
+        external, user=users["med_admin"], expected_revision=external.revision,
+        uploaded_file=SimpleUploadedFile("evidence.txt", b"Private browser audit file"),
+    )
+    evidence = Path(os.environ.get("LIVE_BROWSER_EVIDENCE_DIR", str(tmp_path / "evidence"))).resolve() / phase
+    evidence.mkdir(parents=True, exist_ok=True)
+    manifest = {
+        "origin": live_server.url, "root": str(settings.BASE_DIR), "output": str(evidence / "live-browser.json"), "phase": phase,
+        "offices": {key: value.pk for key, value in offices.items()}, "seeded": seeded,
+        "today": timezone.localdate().isoformat(), "sessionCookie": settings.SESSION_COOKIE_NAME,
+        "external": external.pk, "externalDraftUrl": external.get_absolute_url(),
+        "repositoryAlpha": repository_alpha, "outgoing": outgoing.pk,
+        "repositoryReference": repository_reference,
+        "past": timezone.localtime(timezone.now() - timezone.timedelta(days=2)).strftime("%Y-%m-%dT%H:%M"),
+        "screenshotDir": str(evidence / "screenshots"),
+    }
+    manifest_file = tmp_path / "manifest.json"
+    manifest_file.write_text(json.dumps(manifest), encoding="utf-8")
+    node = os.environ.get("AUDIT_NODE", "node")
+    output_lines = []
+    error_file = evidence / 'browser-stderr.txt'
+    with error_file.open('w', encoding='utf-8') as errors:
+        process = subprocess.Popen(
+            [node, str(Path(settings.BASE_DIR) / "scripts/check_systemwide_live.cjs"), str(manifest_file)],
+            cwd=settings.BASE_DIR, env=os.environ.copy(), text=True, encoding='utf-8',
+            stdin=subprocess.PIPE, stdout=subprocess.PIPE, stderr=errors,
+        )
+        timeout = Timer(1200, process.kill)
+        timeout.start()
+        try:
+            for line in process.stdout:
+                event = json.loads(line)
+                if event.get('event') == 'code':
+                    address = users[event['user']].email
+                    latest = next(message for message in reversed(mail.outbox) if message.to == [address])
+                    code = re.search(r'\b(\d{6})\b', latest.body).group(1)
+                    process.stdin.write(code + '\n')
+                    process.stdin.flush()
+                else:
+                    output_lines.append(line)
+            process.wait(timeout=30)
+        finally:
+            timeout.cancel()
+            if process.poll() is None:
+                process.kill()
+                process.wait(timeout=10)
+    safe_errors = re.sub(r'\b\d{6}\b', '[test-code-redacted]', error_file.read_text(encoding='utf-8'))
+    error_file.write_text(safe_errors, encoding='utf-8')
+    output = ''.join(output_lines) + safe_errors
+    (evidence / "live-browser-output.txt").write_text(output, encoding="utf-8")
+    assert process.returncode == 0, output
+    created = TrackingRecord.objects.get(subject="Browser created and filed")
+    assert created.status == Status.COMPLETED
+    assert Document.objects.filter(tracking_record=created, collection=Collection.OVPA).count() == 1
+    external.refresh_from_db()
+    assert external.status == Status.COMPLETED
+    assert Document.objects.filter(external_tracking_record=external, collection=Collection.EXTERNAL).count() == 1
+    assert ExternalTrackingRecord.objects.filter(pk=external.pk).count() == 1

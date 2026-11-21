@@ -1,0 +1,183 @@
+{% load doctrack %}
+{% comment %}
+  The tracking queue panel's queue: its chips, the queue picked and its first rows.
+  Rendered inside the dashboard, and alone when a chip is clicked with HTMX
+  (DashboardView.get, HX-Target "action-centre-queue"), so the swap and the
+  full page are one template.
+
+  Each chip is an `apply_scope` queue counted with the dashboard's office, and
+  its "View all in Tracking" link opens the same queue with the same office, so
+  the number on the chip is the number of rows that page lists. The chips are
+  links: without script they reload the page, with HTMX they swap this block
+  and push the URL, so Back and a bookmark still land on the queue picked.
+{% endcomment %}
+<div id="{{ desk_target }}" class="desk-queue">
+  <div class="card-udm-head action-centre-head">
+    <div>
+      <h2>Currently tracking</h2>
+      <div class="card-udm-caption">Filter by direction and document stage.{% if not user.is_viewer %} Confirm receipts for documents at your office.{% endif %}</div>
+    </div>
+    <a class="btn btn-dashboard-action btn-sm" href="{{ desk_queue.tracking_url }}"
+       aria-label="Open {{ desk_queue.label }} in Tracking{% if desk_queue.count %}, {{ desk_queue.count }} documents{% endif %}">
+      <span>{% if desk_queue.count %}View all {{ desk_queue.count }} document{{ desk_queue.count|pluralize }}{% else %}Open Tracking{% endif %}</span>
+      {% include "partials/_dashboard_action_arrow.html" %}
+    </a>
+  </div>
+  {% include "partials/_direction_filters.html" with groups=desk_direction_groups prefix="desk-direction" %}
+  <nav class="desk-chips" aria-label="Receipt reminders and overdue work">
+    <span class="desk-attention-label">Needs attention</span>
+    {% for queue in desk_attention_queues %}
+      {% if queue.disabled %}
+        <span class="pill-toggle is-disabled" aria-disabled="true"
+              title="{{ queue.label }} describes a document relative to one office. Pick an office to use it.">{{ queue.label }}</span>
+      {% else %}
+        <a class="pill-toggle{% if queue.slug == 'overdue' %} pill-toggle--alert{% endif %}{% if queue.active %} is-active{% endif %}"
+           href="{{ queue.href }}"{% if queue.active %} aria-current="true"{% endif %}
+           hx-get="{{ queue.href }}" hx-target="#{{ desk_target }}" hx-swap="outerHTML" hx-push-url="true">
+          {{ queue.label }} <span class="desk-chip-count num">{{ queue.count }}</span>
+        </a>
+      {% endif %}
+    {% endfor %}
+    {% if desk_queue.slug != "awaiting" %}
+      <a class="pill-toggle desk-chip-clear" href="{{ desk_clear_href }}"
+         hx-get="{{ desk_clear_href }}" hx-target="#{{ desk_target }}" hx-swap="outerHTML" hx-push-url="true">Reset queue</a>
+    {% endif %}
+  </nav>
+  {% if desk_queue.slug == 'awaiting' %}
+    <p class="desk-block-caption">Awaiting receipt shows routes with an unconfirmed recipient, including documents another recipient has already received.</p>
+  {% endif %}
+
+      {% comment %}
+        The form wraps the selected queue only. Latest tracking activity is read-only, and
+        a form spanning both would put rows nobody can act on inside the thing that
+        submits.
+
+        Bulk receipt keeps its custody attestation here rather than trading it for a
+        one-click button: `BulkConfirmReceiptForm.confirm_custody` is required, and
+        it is required because somebody is asserting the documents are physically in
+        their office. That assertion lands in an append-only audit trail, so the
+        dashboard asks for it in the same words the tracking list does.
+      {% endcomment %}
+      {% if can_bulk_receive %}
+        <form method="post" action="{% url 'tracking:bulk_confirm_receipt' %}{% if request.GET %}?{{ request.GET.urlencode }}{% endif %}" novalidate>{% csrf_token %}
+          <input type="hidden" name="next" value="dashboard">
+      {% endif %}
+
+      <div class="desk-block desk-block--primary">
+        <h3 class="desk-block-title">
+          {{ desk_queue.label }}
+          <span class="desk-block-count">Showing {{ attention_records|length }} of {{ desk_queue.count }}</span>
+        </h3>
+        <div class="card-udm-body p-0">
+          {% if attention_records %}
+            <div class="table-responsive" tabindex="0" role="region" aria-label="{{ desk_queue.label }} documents"><table class="table-udm desk-records-table">
+              {% if show_office_columns %}
+                <thead>
+                  <tr>
+                    {% if can_bulk_receive %}<th scope="col"><span class="visually-hidden">Select for receipt</span></th>{% endif %}
+                    <th scope="col">Document</th><th scope="col">Originating office</th><th scope="col">Awaiting receipt</th><th scope="col"><span class="visually-hidden">Status or action</span></th>
+                  </tr>
+                </thead>
+              {% else %}
+                <thead class="visually-hidden">
+                  <tr>
+                    {% if can_bulk_receive %}<th scope="col">Select for receipt</th>{% endif %}
+                    <th scope="col">Document</th><th scope="col">Status or action</th>
+                  </tr>
+                </thead>
+              {% endif %}
+              <tbody>
+              {% for record in attention_records %}
+                <tr>
+                  {% if can_bulk_receive %}
+                    <td>
+                      {% if record.can_confirm_now %}
+                        <input class="form-check-input" type="checkbox" name="record_ids" value="{{ record.pk }}"
+                               aria-label="Select {{ record.display_tracking_number }} for receipt">
+                      {% endif %}
+                    </td>
+                  {% endif %}
+                  {% if show_office_columns %}
+                    <td class="desk-cell">
+                      <a class="mono" href="{{ record.stage_url|default:record.get_absolute_url }}">{{ record.display_tracking_number }}</a>
+                      {% comment %}
+                        The subject decides the width of this whole panel if it
+                        is allowed to. .desk-cell-title caps it and wraps to a
+                        second line, so a long subject makes a row slightly
+                        taller instead of pushing the card sideways and leaving
+                        the panel beside it half as wide. The full text is on
+                        the title attribute and on the record page.
+                      {% endcomment %}
+                      <div class="desk-cell-title" title="{{ record.subject }}">{{ record.subject|truncatechars:110 }}</div>
+                      <div class="text-muted" style="font-size:12.5px;">
+                        updated {{ record.last_movement_at|timesince }} ago
+                      </div>
+                    </td>
+                    <td class="office-cell">{% include "partials/_office_badge.html" with office=record.originating_office %}</td>
+                    <td class="office-cell" data-receipt-offices="pending">{% include "partials/_receipt_offices.html" with kind="pending" %}</td>
+                  {% else %}
+                    <td class="desk-cell desk-cell--wide">
+                      <a class="mono" href="{{ record.stage_url|default:record.get_absolute_url }}">{{ record.display_tracking_number }}</a>
+                      {# Same cap as the records-staff view above, one column wider. #}
+                      <div class="desk-cell-title" style="font-size:14px;" title="{{ record.subject }}">{{ record.subject|truncatechars:110 }}</div>
+                      <div class="text-muted" style="font-size:12.5px;">
+                        Originating office: {{ record.originating_office.code }} · updated {{ record.last_movement_at|timesince }} ago
+                      </div>
+                    </td>
+                  {% endif %}
+                  <td class="text-end">
+                    {% if record.can_confirm_now %}
+                      <a class="btn btn-receipt btn-sm" href="{{ record.stage_url|default:record.get_absolute_url }}">
+                        <span class="btn-receipt-icon" aria-hidden="true">✓</span>
+                        <span>Confirm Receipt</span>
+                      </a>
+                    {% else %}
+                      {% include "partials/_status_pill.html" with status=record.display_status %}{% include "partials/_overdue_tag.html" with overdue=record.is_overdue %}
+                    {% endif %}
+                  </td>
+                </tr>
+              {% endfor %}
+              </tbody>
+            </table></div>
+          {% else %}
+            {% comment %}
+              This linked to `?scope=inbox` while the panel head linked to
+              `?scope=incoming`, under a comment claiming both resolved to the
+              same queue. They do not: `inbox` is unconfirmed steps only, and
+              on the demo data one office saw 9 against incoming's 5. Two links
+              in one panel, labelled the same, opening different queues.
+            {% endcomment %}
+            <div class="empty-state">
+              {% if desk_queue.slug == "pending-receipt" %}
+                <h3>No incoming documents are waiting</h3>
+                <p>Documents routed to {% if scope.office %}{{ scope.office.code }}{% elif user.office %}{{ user.office.code }}{% else %}your office{% endif %} appear here until someone confirms receipt.</p>
+              {% else %}
+                <h3>Nothing in &ldquo;{{ desk_queue.label }}&rdquo;</h3>
+                <p>No document {% if scope.office %}for {{ scope.office.code }} {% endif %}is in this queue right now.</p>
+              {% endif %}
+            </div>
+          {% endif %}
+        </div>
+
+        {% comment %}
+          Same three controls as the tracking list, in the same order and the same
+          words: an optional shared note, the custody attestation, then the submit.
+          Receipt is one act with one wording wherever it is offered.
+        {% endcomment %}
+        {% if can_bulk_receive %}
+          <div class="card-udm-body border-top">
+            <label class="form-label" for="desk-receipt-note">Receipt note for all selected records (optional)</label>
+            <textarea class="form-control" id="desk-receipt-note" name="note" maxlength="2000" rows="2"
+                      placeholder="Add the same custody note to each selected record"></textarea>
+            <div class="form-check mt-3">
+              <input class="form-check-input" type="checkbox" name="confirm_custody" id="desk-confirm-custody" required>
+              <label class="form-check-label" for="desk-confirm-custody">I confirm the selected physical or digital documents are present in my office's custody.</label>
+            </div>
+            <button class="btn btn-receipt mt-3" type="submit">Confirm Receipt for Selected</button>
+          </div>
+        {% endif %}
+      </div>
+
+      {% if can_bulk_receive %}</form>{% endif %}
+
+</div>

@@ -1,0 +1,49 @@
+from django.urls import path
+from django.views.generic import RedirectView
+
+from . import file_views, upload_views, views
+
+app_name = "core"
+
+urlpatterns = [
+    path("uploads/saved/", upload_views.UploadDraftListView.as_view(), name="upload_drafts"),
+    path("uploads/drafts/<uuid:draft_id>/discard/", upload_views.DiscardUploadDraftView.as_view(), name="upload_draft_discard"),
+    path("uploads/drafts/", upload_views.UploadDraftCreateView.as_view(), name="upload_draft_create"),
+    path("uploads/drafts/<uuid:draft_id>/", upload_views.UploadDraftView.as_view(), name="upload_draft"),
+    path("uploads/drafts/<uuid:draft_id>/files/", upload_views.StageUploadView.as_view(), name="upload_draft_files"),
+    path("uploads/drafts/<uuid:draft_id>/files/<uuid:file_id>/remove/", upload_views.RemoveStagedUploadView.as_view(), name="upload_draft_remove"),
+    path("files/preview/upload/<uuid:pk>/", file_views.FilePreviewView.as_view(), {"kind": "upload"}, name="upload_file_preview"),
+    path("files/content/upload/<uuid:pk>/", file_views.FileContentView.as_view(), {"kind": "upload"}, name="upload_file_content"),
+    path("files/download/upload/<uuid:pk>/", file_views.FileVersionDownloadView.as_view(), {"kind": "upload"}, name="upload_file_download"),
+    path("files/preview-frame/", file_views.PreviewFrameView.as_view(), name="file_preview_frame"),
+    path("files/history/<slug:kind>/<int:pk>/", file_views.FileHistoryView.as_view(), name="file_history"),
+    path("files/preview/<slug:kind>/<int:pk>/", file_views.FilePreviewView.as_view(), name="file_preview"),
+    path("files/content/<slug:kind>/<int:pk>/", file_views.FileContentView.as_view(), name="file_content"),
+    path("files/download/<slug:kind>/<int:pk>/", file_views.FileVersionDownloadView.as_view(), name="file_download"),
+    path("healthz/", views.HealthzView.as_view(), name="healthz"),
+    path("notifications/", views.NotificationListView.as_view(), name="notifications"),
+    path("notifications/count/", views.NotificationCountView.as_view(), name="notification_count"),
+    path("notifications/read-all/", views.NotificationMarkAllReadView.as_view(), name="notification_mark_all_read"),
+    path("notifications/<int:pk>/read/", views.NotificationReadView.as_view(), name="notification_read"),
+    path("", views.DashboardView.as_view(), name="dashboard"),
+    path("memo/print/", views.DashboardMemoPrintView.as_view(), name="dashboard_memo_print"),
+    # Reports is a part of Document Tracking, so it lives under its path and the
+    # sidebar highlights its Reports link there. The names are unchanged, and
+    # the old addresses redirect permanently, query string and all, so a
+    # bookmarked or printed link to a report still opens that report.
+    path("tracking/reports/", views.ReportsView.as_view(), name="reports"),
+    path("documents/reports/", views.ReportsView.as_view(report_domain="documents"), name="repository_reports"),
+    path("tracking/reports/export/", views.ReportExportView.as_view(), name="report_export"),
+    path("reports/", RedirectView.as_view(pattern_name="core:reports", permanent=True, query_string=True)),
+    path(
+        "reports/export/",
+        RedirectView.as_view(pattern_name="core:report_export", permanent=True, query_string=True),
+    ),
+    path("print-log/", views.PrintLogView.as_view(), name="log_print"),
+    path("administration/", views.AdministrationHomeView.as_view(), name="administration"),
+    path("administration/audit-log/", views.AuditLogView.as_view(), name="audit_log"),
+    path("administration/office-schedule/", views.OfficeScheduleView.as_view(), name="office_schedule"),
+    path("administration/<slug:slug>/", views.MasterDataListView.as_view(), name="masterdata_list"),
+    path("administration/<slug:slug>/new/", views.MasterDataEditView.as_view(), name="masterdata_create"),
+    path("administration/<slug:slug>/<int:pk>/", views.MasterDataEditView.as_view(), name="masterdata_edit"),
+]

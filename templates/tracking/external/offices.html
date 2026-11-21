@@ -1,0 +1,52 @@
+{% extends "tracking/external/base.html" %}
+{% block title %}External offices · {{ SITE_NAME }}{% endblock %}
+{% block external_content %}
+<div class="workspace-page workspace-admin workspace-list">
+  <div class="page-head">
+    <div>
+      <div class="eyebrow">Office directory</div>
+      <h1>External UDM offices</h1>
+      <p class="sub">Shared office choices for external documents. Only the office that registered an entry can edit it. External offices do not have DocTrack accounts.</p>
+    </div>
+    {% if user.is_office_admin %}<a class="btn btn-udm" href="{% url 'tracking:external_office_create' %}{{ external_query }}">Add external office</a>{% endif %}
+  </div>
+
+  <div class="card-udm">
+    <div class="card-udm-body p-0 table-responsive" tabindex="0" role="region" aria-label="External office directory">
+      <table class="table-udm">
+        <caption class="visually-hidden">External UDM office directory</caption>
+        <thead>
+          <tr><th scope="col">External office</th><th scope="col">Contact</th><th scope="col">Status</th>{% if user.is_office_admin %}<th scope="col">Actions</th>{% endif %}</tr>
+        </thead>
+        <tbody>
+          {% for office in offices %}
+            <tr>
+              <td><strong>{{ office.name }}</strong><div class="small mono">{{ office.code }}</div></td>
+              <td>{{ office.contact_person }}{% if office.email %}<div>{{ office.email }}</div>{% endif %}{% if office.phone %}<div>{{ office.phone }}</div>{% endif %}</td>
+              <td>{% if office.is_active %}<span class="pill pill-ok">Active</span>{% else %}<span class="pill pill-draft">Inactive</span>{% endif %}</td>
+              {% if user.is_office_admin %}
+                <td>
+                  {% if office.can_edit_entry %}
+                  <div class="d-flex flex-wrap gap-2">
+                    <a class="btn btn-sm btn-udm-outline" href="{% url 'tracking:external_office_edit' office.pk %}{{ external_query }}">Edit<span class="visually-hidden"> {{ office.name }}</span></a>
+                    {% if office.is_active %}
+                      <form method="post" action="{% url 'tracking:external_office_deactivate' office.pk %}{{ external_query }}">
+                        {% csrf_token %}
+                        <input type="hidden" name="revision" value="{{ office.revision }}">
+                        <button type="submit" class="btn btn-sm btn-udm-outline">Deactivate<span class="visually-hidden"> {{ office.name }}</span></button>
+                      </form>
+                    {% endif %}
+                  </div>
+                  {% else %}<span class="text-muted">Read-only entry</span>{% endif %}
+                </td>
+              {% endif %}
+            </tr>
+          {% empty %}
+            <tr><td colspan="{% if user.is_office_admin %}4{% else %}3{% endif %}"><div class="empty-state"><h3>No external offices</h3><p class="mb-0">No external offices have been added within your access.</p></div></td></tr>
+          {% endfor %}
+        </tbody>
+      </table>
+    </div>
+  </div>
+</div>
+{% endblock %}

@@ -1,0 +1,54 @@
+# --- Secrets — never commit these --------------------------------------
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# --- Python ------------------------------------------------------------
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+.Python
+
+# --- Django ------------------------------------------------------------
+# Directory entries are anchored with a leading "/" for the same reason a bare
+# "documents/" is banned below: git treats an unanchored name as "at any
+# depth", so "media/" would also swallow an apps/*/media/ directory the day
+# somebody adds one.
+*.log
+db.sqlite3
+/media/
+/staticfiles/
+/static/vendor/*.map
+
+# --- Uploaded documents (real records must never reach GitHub) ---------
+# MEDIA_ROOT already resolves to /media/ (see line above), which covers every
+# uploaded file. Do NOT add a bare "documents/" pattern here — it silently
+# matches apps/documents/ too, which once deleted the entire Documents app
+# from every commit.
+/uploads/
+training_data*.jsonl
+
+# --- Testing / tooling -------------------------------------------------
+.pytest_cache/
+.coverage
+htmlcov/
+.ruff_cache/
+.mypy_cache/
+
+# --- Claude Code ---------------------------------------------------------
+/.claude/
+/.vercel/
+CLAUDE.md
+
+# --- Editors and OS ----------------------------------------------------
+.vscode/
+.idea/
+*.swp
+.DS_Store
+Thumbs.db
+desktop.ini

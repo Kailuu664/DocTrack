@@ -1,0 +1,22 @@
+<section class="trend-summary dashboard-turnaround-summary" aria-label="Turnaround figures for the selected month">
+  <div class="trend-summary-head">{{ turnaround.month|date:"F Y" }}{% if turnaround.is_current %} so far{% endif %}</div>
+  {% include "core/_turnaround_explanation.html" %}
+  <div class="dashboard-turnaround-stages">
+    {% for stage in turnaround.stages %}
+      {% include "core/_turnaround_stage.html" with id_prefix="turnaround-stage" %}
+    {% endfor %}
+  </div>
+  {% if turnaround.has_on_time %}
+    <div class="dashboard-turnaround-on-time">
+      <div class="meter-head">
+        <span>Completed on time</span>
+        <strong class="num">{{ turnaround.on_time_percent }}%</strong>
+      </div>
+      <div class="meter-track"><i class="meter-fill" style="width:{{ turnaround.on_time_percent }}%"></i></div>
+      <p class="meter-foot">{{ turnaround.on_time }} of {{ turnaround.on_time_total }} document{{ turnaround.on_time_total|pluralize }} with a deadline completed on time this month.</p>
+    </div>
+  {% elif turnaround.show_deadline_summary %}
+    <p class="dashboard-turnaround-empty">No completed documents with a valid timeline and a deadline this month.</p>
+  {% endif %}
+  {% if turnaround.show_waiting_summary %}{% include "core/_turnaround_waiting.html" %}{% endif %}
+</section>

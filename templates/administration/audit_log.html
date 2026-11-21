@@ -1,0 +1,190 @@
+{% extends "base.html" %}
+{% load doctrack %}
+{% block title %}Audit log · {{ SITE_NAME }}{% endblock %}
+{% block content %}
+<div class="workspace-page workspace-admin workspace-audit">
+<div class="page-head"><div>
+  <div class="eyebrow">Administration</div><h1>Audit log</h1>
+  {% if request.user.is_system_admin %}
+    <p class="sub">Sign-ins, routing, receipts, downloads, prints and settings changes. Document access is listed below.</p>
+  {% else %}
+    <p class="sub">Activity verified for {{ request.user.office_label }} and access to its tracking records.
+      Older entries without verified office details are available to the system administrator.</p>
+  {% endif %}
+</div></div>
+{% include "administration/_tabs.html" with tab='audit' %}
+
+<section id="audit-system-results" data-filter-region class="workspace-section" aria-labelledby="system-activity-heading">
+<div class="workspace-section-head"><h2 id="system-activity-heading" class="section-title">System activity</h2></div>
+<div class="card-udm mb-3 workspace-toolbar"><div class="card-udm-body">
+  <form id="audit-system-filters" method="get" class="row g-2 align-items-end admin-filters" {% include "partials/_auto_filter_attrs.html" %}>
+    {% comment %}
+      Both sizes ride through the filter, so narrowing the log does not silently
+      snap a reader who asked for 100 rows back to 25. `page` is deliberately not
+      carried: page four of the old filter is not page four of the new one. The
+      record-access panel's filters ride through too, so narrowing this trail
+      does not reset the other one.
+    {% endcomment %}
+    <input type="hidden" name="per_page" value="{{ system_page.page_size }}">
+    <input type="hidden" name="access_per_page" value="{{ access_page.page_size }}">
+    {% for name, value in access_filters.items %}{% if value %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endif %}{% endfor %}
+    <div class="col-lg-{% if filter_offices %}3{% else %}5{% endif %}">
+      <label class="form-label" for="audit-q">Search</label>
+      <input class="form-control" id="audit-q" name="q" value="{{ query }}" placeholder="What happened, or who did it">
+    </div>
+    <div class="col-6 col-lg-2">
+      <label class="form-label" for="audit-action">Action</label>
+      <select class="form-select" id="audit-action" name="action">
+        <option value="">All actions</option>
+        {% for value, label in actions %}
+          <option value="{{ value }}" {% if selected_action == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    {% if filter_offices %}
+      <div class="col-6 col-lg-2">
+        <label class="form-label" for="audit-office">Office</label>
+        <select class="form-select" id="audit-office" name="office">
+          <option value="">All offices</option>
+          {% for office in filter_offices %}
+            <option value="{{ office.pk }}" {% if system_filters.office == office.pk|stringformat:"s" %}selected{% endif %}>{{ office.code }} · {{ office.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    {% endif %}
+    <div class="col-6 col-lg-2 admin-filter-date">
+      <label class="form-label" for="audit-since">From</label>
+      <input class="form-control" type="date" id="audit-since" name="since" value="{{ system_filters.since }}">
+    </div>
+    <div class="col-6 col-lg-2 admin-filter-date">
+      <label class="form-label" for="audit-until">To</label>
+      <input class="form-control" type="date" id="audit-until" name="until" value="{{ system_filters.until }}">
+    </div>
+    <div class="col-lg-1 d-grid"><button class="btn btn-udm-outline" type="submit">Search</button></div>
+  </form>
+  <div class="admin-filter-summary">
+    {{ system_page.page_obj.paginator.count }} entr{{ system_page.page_obj.paginator.count|pluralize:"y,ies" }}
+    {% if system_is_filtered %}· <a href="?{% for name, value in access_filters.items %}{% if value %}{{ name }}={{ value|urlencode }}&amp;{% endif %}{% endfor %}" data-filter-discard="#audit-system-filters">Clear these filters</a>{% endif %}
+  </div>
+</div></div>
+
+{% comment %}
+  Each panel's own control, above its own table. `system_page` and `access_page`
+  carry different parameter names, so neither half of either bar moves the other
+  trail.
+{% endcomment %}
+{% pager system_page section="size" %}
+<div class="card-udm"><div class="card-udm-body p-0 table-responsive">
+  <table class="table-udm">
+    <thead><tr><th>When</th><th>Who</th><th>Action</th><th>Summary</th><th>IP</th></tr></thead>
+    <tbody>
+      {% for entry in entries %}
+        <tr>
+          <td style="white-space:nowrap;">{{ entry.created_at|date:"d M Y, g:i A" }}</td>
+          <td>{{ entry.actor_label }}</td>
+          <td><span class="pill pill-muted">{{ entry.get_action_display }}</span></td>
+          <td>{{ entry.summary }}</td>
+          <td class="text-muted" style="font-size:12.5px;">{{ entry.ip_address|default:"—" }}</td>
+        </tr>
+      {% empty %}<tr><td colspan="5" class="p-4 text-muted">Nothing logged yet.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</div></div>
+
+{# Its own page object, so Next here does not also move the panel below. #}
+{% pager system_page section="steps" %}
+</section>
+
+{% comment %}
+  Who read and who printed. A separate panel because it comes from the record
+  timeline rather than from AuditLog, and because it is the panel that makes
+  logging reads worth doing: a view-only account leaves no other trace, so
+  without somewhere to inspect these rows the trail answers nobody.
+{% endcomment %}
+<div id="audit-access-results" data-filter-region class="card-udm mt-4 workspace-panel">
+  <div class="card-udm-head">
+    <div>
+      <h2>Record access</h2>
+      <div class="card-udm-caption">
+        Who opened and who printed a document, every role included. Repeated opens
+        by the same person collapse into one entry per {{ view_dedup_minutes }} minutes,
+        so these are reading sessions rather than page loads. Prints are never
+        collapsed — each one is a separate copy leaving the system.
+      </div>
+    </div>
+  </div>
+  <div class="card-udm-body">
+    <form id="audit-access-filters" method="get" class="row g-2 align-items-end admin-filters" {% include "partials/_auto_filter_attrs.html" %}>
+      {# Carried through so filtering one panel does not reset the other. #}
+      {% for name, value in system_filters.items %}{% if value %}<input type="hidden" name="{{ name }}" value="{{ value }}">{% endif %}{% endfor %}
+      <input type="hidden" name="per_page" value="{{ system_page.page_size }}">
+      <input type="hidden" name="access_per_page" value="{{ access_page.page_size }}">
+      <div class="col-lg-3">
+        <label class="form-label" for="access-record">Document</label>
+        <input class="form-control" id="access-record" name="record" value="{{ record_query }}"
+               placeholder="Tracking number or subject">
+      </div>
+      <div class="col-lg-2">
+        <label class="form-label" for="access-who">Person</label>
+        <input class="form-control" id="access-who" name="who" value="{{ who_query }}"
+               placeholder="Who opened or printed it">
+      </div>
+      <div class="col-6 col-lg-2">
+        <label class="form-label" for="access-event">What</label>
+        <select class="form-select" id="access-event" name="event">
+          <option value="">Opened or printed</option>
+          {% for value, label in access_events %}
+            <option value="{{ value }}" {% if access_filters.event == value %}selected{% endif %}>{{ label }}</option>
+          {% endfor %}
+        </select>
+      </div>
+      <div class="col-6 col-lg-2 admin-filter-date">
+        <label class="form-label" for="access-since">From</label>
+        <input class="form-control" type="date" id="access-since" name="access_since" value="{{ access_filters.access_since }}">
+      </div>
+      <div class="col-6 col-lg-2 admin-filter-date">
+        <label class="form-label" for="access-until">To</label>
+        <input class="form-control" type="date" id="access-until" name="access_until" value="{{ access_filters.access_until }}">
+      </div>
+      <div class="col-lg-1 d-grid"><button class="btn btn-udm-outline" type="submit">Search</button></div>
+    </form>
+    <div class="admin-filter-summary">
+      {{ access_page.page_obj.paginator.count }} entr{{ access_page.page_obj.paginator.count|pluralize:"y,ies" }}
+      {% if access_is_filtered %}· <a href="?{% for name, value in system_filters.items %}{% if value %}{{ name }}={{ value|urlencode }}&amp;{% endif %}{% endfor %}" data-filter-discard="#audit-access-filters">Clear these filters</a>{% endif %}
+    </div>
+  </div>
+  <div class="card-udm-body pb-0">{% pager access_page section="size" %}</div>
+  <div class="card-udm-body p-0 table-responsive">
+    <table class="table-udm">
+      <thead><tr><th>When</th><th>Who</th><th>Office</th><th>What</th><th>Document</th></tr></thead>
+      <tbody>
+        {% for entry in access_entries %}
+          <tr>
+            <td style="white-space:nowrap;">{{ entry.created_at|date:"d M Y, g:i A" }}</td>
+            <td>{{ entry.actor.display_name|default:"—" }}</td>
+            <td class="office-cell">
+              {% if entry.actor_office %}
+                {% include "partials/_office_badge.html" with office=entry.actor_office %}
+              {% else %}<span class="text-muted">—</span>{% endif %}
+            </td>
+            <td><span class="pill pill-muted">{{ entry.get_event_display }}</span></td>
+            <td class="mono">
+              <a href="{{ entry.record.get_absolute_url }}">{{ entry.record.display_tracking_number }}</a>
+            </td>
+          </tr>
+        {% empty %}
+          <tr><td colspan="5" class="p-4 text-muted">
+            {% if access_is_filtered %}
+              No opens or prints match that search.
+            {% else %}
+              No document has been opened or printed yet.
+            {% endif %}
+          </td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  <div class="card-udm-body pt-0">{% pager access_page section="steps" %}</div>
+</div>
+</div>
+{% endblock %}

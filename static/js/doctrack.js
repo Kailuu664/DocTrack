@@ -1,0 +1,1569 @@
+/* HTMX responses stay on this origin and cannot execute embedded scripts.
+   Use a normal event listener for polling visibility so CSP needs no eval. */
+(function () {
+  "use strict";
+  if (window.htmx && window.htmx.config) {
+    window.htmx.config.allowEval = false;
+    window.htmx.config.allowScriptTags = false;
+    window.htmx.config.selfRequestsOnly = true;
+  }
+  document.addEventListener("htmx:beforeRequest", function (event) {
+    var element = event.detail && event.detail.elt;
+    if (document.visibilityState === "hidden" && element && element.hasAttribute("data-notification-poll")) {
+      event.preventDefault();
+    }
+  });
+})();
+
+/* One calculation dialog outside chart containers, usable by keyboard and touch. */
+(function () {
+  "use strict";
+  var dialog = document.getElementById("turnaround-calculation-dialog");
+  if (!dialog) return;
+  dialog.addEventListener("show.bs.modal", function (event) {
+    var button = event.relatedTarget;
+    if (!button || !button.hasAttribute("data-turnaround-calculation")) return;
+    dialog.querySelector("#turnaround-calculation-title").textContent = button.dataset.stageLabel + " calculation";
+    dialog.querySelector("[data-calculation-equation]").textContent = button.dataset.equation;
+    dialog.querySelector("[data-calculation-average]").textContent = button.dataset.averageEquation;
+    var scope = button.closest(".card-udm") || document;
+    var guide = scope.querySelector(".turnaround-time-guide");
+    var schedule = dialog.querySelector("[data-calculation-schedule]");
+    schedule.replaceChildren();
+    if (guide) schedule.appendChild(guide.cloneNode(true));
+  });
+})();
+
+/* Explanatory copy lives in one right-side guide. Keep the original inline
+   content when Bootstrap is unavailable, including when JavaScript is off. */
+(function () {
+  "use strict";
+  var panel = document.getElementById("page-help-panel");
+  if (!panel || !window.bootstrap || !window.bootstrap.Offcanvas) return;
+  var select = panel.querySelector("[data-page-help-topic]");
+  var content = panel.querySelector("[data-page-help-content]");
+  var launch = document.querySelector("[data-page-help-open]");
+  var groups = [];
+  var sequence = 0;
+  var opener = null;
+
+  function choose(id) {
+    var chosen = groups.find(function (group) { return group.id === id; }) || groups[0];
+    if (!chosen) return;
+    select.value = chosen.id;
+    groups.forEach(function (group) { group.section.hidden = group !== chosen; });
+    panel.querySelector(".offcanvas-body").scrollTop = 0;
+  }
+
+  function open(group, trigger) {
+    opener = trigger;
+    choose(group ? group.id : select.value);
+    window.bootstrap.Offcanvas.getOrCreateInstance(panel).show(trigger);
+  }
+
+  function enhance() {
+    // HTMX may replace the original panel. Remove detached topics and keep
+    // existing ones rather than duplicating help on every queue update.
+    groups = groups.filter(function (group) {
+      group.items = group.items.filter(function (item) {
+        if (item.anchor.isConnected) return true;
+        item.source.remove();
+        return false;
+      });
+      if (group.items.length) return true;
+      group.section.remove();
+      if (group.button) group.button.remove();
+      if (group.head) group.head.classList.remove("has-page-help");
+      return false;
+    });
+    document.querySelectorAll("details.chart-note, [data-help-title]").forEach(function (source) {
+      if (panel.contains(source)) return;
+      // A whole overview can contain several explanations; move it once.
+      if (source.parentElement.closest("details.chart-note, [data-help-title]")) return;
+      var card = source.closest(".card-udm");
+      var owner = card || source;
+      var group = groups.find(function (entry) { return entry.owner === owner; });
+      if (!group) {
+        var heading = card && card.querySelector("h2, h3");
+        var summary = source.querySelector(".disclosure-title");
+        var title = heading ? heading.textContent.trim() :
+          source.dataset.helpTitle || (summary && summary.textContent.trim()) || "About this page";
+        var section = document.createElement("section");
+        var id = "page-help-section-" + (++sequence);
+        section.id = id;
+        section.className = "page-help-section";
+        var label = document.createElement("h3");
+        label.id = id + "-title";
+        label.textContent = title;
+        section.setAttribute("aria-labelledby", label.id);
+        section.appendChild(label);
+        content.appendChild(section);
+        group = {id: id, title: title, owner: owner, section: section, items: []};
+        groups.push(group);
+        var head = card && card.querySelector(".card-udm-head");
+        if (head) {
+          var button = document.createElement("button");
+          button.type = "button";
+          button.className = "page-help-info no-print";
+          var icon = document.getElementById("page-help-icon-template");
+          button.appendChild(icon.content.firstElementChild.cloneNode(true));
+          button.setAttribute("aria-label", "About " + title);
+          button.setAttribute("aria-controls", panel.id);
+          button.title = "About " + title;
+          button.addEventListener("click", function () { open(group, button); });
+          head.appendChild(button);
+          head.classList.add("has-page-help");
+          group.head = head;
+          group.button = button;
+        }
+      }
+      var anchor = document.createElement("span");
+      anchor.hidden = true;
+      source.replaceWith(anchor);
+      if (source.matches("details")) source.open = true;
+      source.querySelectorAll("details").forEach(function (detail) { detail.open = true; });
+      group.section.appendChild(source);
+      group.items.push({anchor: anchor, source: source});
+    });
+    var previous = select.value;
+    select.replaceChildren();
+    groups.forEach(function (group) {
+      var option = document.createElement("option");
+      option.value = group.id;
+      option.textContent = group.title;
+      select.appendChild(option);
+    });
+    choose(previous);
+    if (launch) launch.hidden = groups.length === 0;
+  }
+
+  select.addEventListener("change", function () { choose(select.value); });
+  if (launch) launch.addEventListener("click", function () { open(null, launch); });
+  panel.addEventListener("hidden.bs.offcanvas", function () {
+    if (opener && opener.isConnected) opener.focus();
+  });
+  document.addEventListener("htmx:afterSwap", enhance);
+  document.addEventListener("htmx:historyRestore", enhance);
+  enhance();
+})();
+
+/* UDM DocTrack — small, dependency-free helpers.
+   Everything here is progressive enhancement: if this file fails to load,
+   every form still works as a plain HTML form. */
+(function () {
+  "use strict";
+
+  /* ----------------------------------------------------------------------
+     1. Searchable multi-select (used for "receiving offices")
+     Turns a <select multiple> into a filter box + checkbox list.
+  ---------------------------------------------------------------------- */
+  function buildSearchableMultiSelect(select) {
+    if (select.dataset.enhanced === "1") return;
+    select.dataset.enhanced = "1";
+
+    var fieldLabel = select.id ? document.querySelector('label[for="' + select.id + '"]') : null;
+    var noun = select.dataset.itemNoun || "office";
+
+    var wrapper = document.createElement("div");
+    wrapper.className = "multiselect";
+    wrapper.setAttribute("role", "group");
+    if (fieldLabel) {
+      wrapper.setAttribute("aria-label", fieldLabel.textContent.replace(/\*/g, "").trim());
+    }
+    var descriptions = select.getAttribute("aria-describedby");
+    if (descriptions) wrapper.setAttribute("aria-describedby", descriptions);
+    if (select.getAttribute("aria-invalid") === "true") wrapper.setAttribute("aria-invalid", "true");
+
+    var filter = document.createElement("input");
+    filter.type = "search";
+    filter.className = "multiselect-search";
+    filter.placeholder = select.dataset.placeholder || "Type to filter offices…";
+    filter.setAttribute("aria-label", fieldLabel ? "Filter " + fieldLabel.textContent.replace(/\*/g, "").trim() : "Filter the list");
+    if (descriptions) filter.setAttribute("aria-describedby", descriptions);
+    if (select.getAttribute("aria-invalid") === "true") filter.setAttribute("aria-invalid", "true");
+
+    var list = document.createElement("div");
+    list.className = "multiselect-list";
+
+    var empty = document.createElement("div");
+    empty.className = "multiselect-empty";
+    empty.hidden = true;
+
+    var footer = document.createElement("div");
+    footer.className = "multiselect-footer";
+
+    var count = document.createElement("span");
+    count.className = "multiselect-count";
+    /* Announced politely: selecting is the whole job of this control, so the
+       running total is worth speaking, unlike a per-second countdown. */
+    count.setAttribute("role", "status");
+    count.setAttribute("aria-live", "polite");
+
+    var clear = document.createElement("button");
+    clear.type = "button";  // inside a <form>, an unqualified button submits it
+    clear.className = "multiselect-clear";
+    clear.textContent = "Clear all";
+    clear.hidden = true;
+
+    var summary = document.createElement("div");
+    summary.className = "multiselect-summary";
+
+    var entries = [];
+
+    function setSelected(option, isSelected) {
+      option.selected = isSelected;
+      refresh();
+    }
+
+    function buildChips(chosen) {
+      summary.innerHTML = "";
+      chosen.forEach(function (option) {
+        var chip = document.createElement("span");
+        chip.className = "tag-chip";
+
+        var text = document.createElement("span");
+        text.textContent = option.text;
+        chip.appendChild(text);
+
+        var remove = document.createElement("button");
+        remove.type = "button";
+        remove.className = "multiselect-chip-remove";
+        remove.innerHTML = "&times;";
+        remove.setAttribute("aria-label", "Remove " + option.text);
+        remove.addEventListener("click", function () {
+          setSelected(option, false);
+          filter.focus();
+        });
+        chip.appendChild(remove);
+
+        summary.appendChild(chip);
+      });
+    }
+
+    function refresh() {
+      var chosen = [];
+      entries.forEach(function (entry) {
+        entry.box.checked = entry.option.selected;
+        entry.row.classList.toggle("is-selected", entry.option.selected);
+        if (entry.option.selected) chosen.push(entry.option);
+      });
+
+      count.textContent = chosen.length
+        ? chosen.length + " of " + entries.length + " selected"
+        : "No " + noun + " selected yet";
+      clear.hidden = chosen.length === 0;
+
+      buildChips(chosen);
+    }
+
+    Array.prototype.forEach.call(select.options, function (option) {
+      var row = document.createElement("label");
+      row.className = "multiselect-option";
+
+      var box = document.createElement("input");
+      box.type = "checkbox";
+      box.checked = option.selected;
+      box.addEventListener("change", function () {
+        setSelected(option, box.checked);
+      });
+
+      var text = document.createElement("span");
+      text.textContent = option.text;
+
+      row.appendChild(box);
+      row.appendChild(text);
+      row.dataset.search = option.text.toLowerCase();
+      list.appendChild(row);
+      entries.push({ option: option, row: row, box: box });
+    });
+
+    filter.addEventListener("input", function () {
+      var needle = filter.value.trim().toLowerCase();
+      var visible = 0;
+      entries.forEach(function (entry) {
+        var match = !needle || entry.row.dataset.search.indexOf(needle) !== -1;
+        entry.row.hidden = !match;
+        if (match) visible += 1;
+      });
+      empty.hidden = visible !== 0;
+      empty.textContent = 'No ' + noun + ' matches "' + filter.value.trim() + '".';
+    });
+
+    clear.addEventListener("click", function () {
+      entries.forEach(function (entry) { entry.option.selected = false; });
+      refresh();
+      filter.focus();
+    });
+
+    /* The checkbox list replaces the native control, so the select is taken
+       out of the tab order and the accessibility tree — left in both, a
+       screen reader would announce every office twice. It stays in the DOM
+       because it is what actually submits. */
+    select.classList.add("visually-hidden");
+    select.setAttribute("aria-hidden", "true");
+    select.setAttribute("tabindex", "-1");
+
+    /* The field's <label> still points at the now-hidden select, so send
+       clicks on it to the filter box instead of a control nobody can see. */
+    if (fieldLabel) {
+      fieldLabel.addEventListener("click", function (event) {
+        event.preventDefault();
+        filter.focus();
+      });
+    }
+
+    select.parentNode.insertBefore(wrapper, select);
+    footer.appendChild(count);
+    footer.appendChild(clear);
+    wrapper.appendChild(filter);
+    wrapper.appendChild(list);
+    wrapper.appendChild(empty);
+    wrapper.appendChild(footer);
+    wrapper.appendChild(summary);
+    wrapper.appendChild(select);
+    refresh();
+  }
+
+  document.querySelectorAll("select[multiple].js-searchable").forEach(buildSearchableMultiSelect);
+
+  /* ----------------------------------------------------------------------
+     2. File inputs: show what was picked, and warn on oversized files.
+  ---------------------------------------------------------------------- */
+  var maxMb = parseInt(document.body.dataset.maxUploadMb || "25", 10);
+
+  document.querySelectorAll('input[type="file"]').forEach(function (input) {
+    var readout = document.createElement("div");
+    readout.className = "form-text mt-2";
+    input.parentNode.appendChild(readout);
+
+    input.addEventListener("change", function () {
+      if (!input.files || !input.files.length) {
+        readout.textContent = "";
+        return;
+      }
+      var names = [];
+      var oversized = [];
+      Array.prototype.forEach.call(input.files, function (file) {
+        names.push(file.name);
+        if (file.size > maxMb * 1024 * 1024) oversized.push(file.name);
+      });
+      readout.textContent = names.length + " file(s): " + names.join(", ");
+      if (oversized.length) {
+        readout.classList.add("text-danger");
+        readout.textContent += " — too large (limit " + maxMb + " MB): " + oversized.join(", ");
+      } else {
+        readout.classList.remove("text-danger");
+      }
+    });
+  });
+
+  /* ----------------------------------------------------------------------
+     3. Guard rails on actions that cannot be undone.
+     Receipt and completion are permanent, so ask once.
+  ---------------------------------------------------------------------- */
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    if (form.matches("form[action*='/receipt/']")) {
+      var ok = window.confirm(
+        "Confirm that your office is taking custody of this document now?\n\n" +
+        "The date and time are recorded permanently and cannot be edited later."
+      );
+      if (!ok) event.preventDefault();
+    }
+    if (form.matches("form[action*='/complete/']")) {
+      /* The status name comes from the page, through the same badge filter. */
+      var status = form.getAttribute("data-completed-status") || "Completed - Pending Filing";
+      var completed = window.confirm(
+        "Mark this document as completed?\n\n" +
+        "It stays in Document Tracking, marked " + status + ", until an administrator approves it into the Document Repository."
+      );
+      if (!completed) event.preventDefault();
+    }
+  });
+
+  /* ----------------------------------------------------------------------
+     4. Stop double submissions — a second click must not create a second record.
+  ---------------------------------------------------------------------- */
+  document.addEventListener("submit", function (event) {
+    var form = event.target;
+    if (form.method.toLowerCase() === "get") return;
+    window.setTimeout(function () {
+      if (event.defaultPrevented) return;
+      form.querySelectorAll('button[type="submit"]').forEach(function (button) {
+        button.disabled = true;
+        if (!button.dataset.originalText) {
+          button.dataset.originalText = button.textContent;
+          button.textContent = "Working…";
+        }
+      });
+    }, 0);
+  });
+
+  /* ----------------------------------------------------------------------
+     5. Phase 2 form helpers.
+     These keep the existing backend field names while presenting the new UI.
+  ---------------------------------------------------------------------- */
+  document.documentElement.classList.add("phase2-js");
+
+  /* ----------------------------------------------------------------------
+     Deadline: reveal the calendar only when the answer is "set a deadline".
+     The panel is rendered visible, so with this script blocked the field is
+     still complete and usable — hiding is the enhancement, not the default.
+  ---------------------------------------------------------------------- */
+  document.querySelectorAll("[data-deadline-field]").forEach(function (field) {
+    var panel = field.querySelector("[data-deadline-panel]");
+    var dateInput = field.querySelector("[data-deadline-date]");
+    var timeInput = field.querySelector("[data-deadline-time]");
+    var clearActions = field.querySelector("[data-deadline-clear-actions]");
+    var clearDeadline = field.querySelector("[data-clear-deadline]");
+    var clearTime = field.querySelector("[data-clear-deadline-time]");
+    var noDeadline = field.querySelector('[data-deadline-choice][value="none"]');
+    var radios = field.querySelectorAll("[data-deadline-choice]");
+    if (!panel || !radios.length) return;
+
+    function chosen() {
+      var picked = field.querySelector("[data-deadline-choice]:checked");
+      return picked ? picked.value : "";
+    }
+
+    function sync(focusDate) {
+      var wantsDate = chosen() === "date";
+      panel.hidden = !wantsDate;
+      if (dateInput) {
+        /* The field is only required once a deadline is asked for, which no
+           static `required` attribute can express. The server enforces the
+           same rule; this just saves a round trip. */
+        dateInput.required = wantsDate;
+        if (!wantsDate) dateInput.value = "";
+        if (wantsDate && focusDate) dateInput.focus();
+      }
+      if (timeInput && !wantsDate) timeInput.value = "";
+      if (clearDeadline) clearDeadline.disabled = !wantsDate;
+      if (clearTime) clearTime.disabled = !wantsDate || !timeInput || !timeInput.value;
+    }
+
+    if (clearDeadline && noDeadline) {
+      clearDeadline.addEventListener("click", function () {
+        noDeadline.checked = true;
+        noDeadline.dispatchEvent(new Event("change", {bubbles: true}));
+        noDeadline.focus();
+      });
+    }
+    if (clearTime && timeInput) {
+      clearTime.addEventListener("click", function () {
+        timeInput.value = "";
+        timeInput.dispatchEvent(new Event("input", {bubbles: true}));
+        timeInput.dispatchEvent(new Event("change", {bubbles: true}));
+        timeInput.focus();
+      });
+      timeInput.addEventListener("input", function () { sync(false); });
+      timeInput.addEventListener("change", function () { sync(false); });
+    }
+    radios.forEach(function (radio) {
+      radio.addEventListener("change", function () { sync(true); });
+    });
+    if (clearActions) clearActions.hidden = false;
+    sync(false);
+  });
+
+  document.querySelectorAll("[data-back-to-edit]").forEach(function (button) {
+    button.addEventListener("click", function () {
+      window.history.back();
+    });
+  });
+
+
+  /* ----------------------------------------------------------------------
+     Reports: tab switching.
+     Lives here rather than inline in the template so it still runs once
+     ENABLE_CSP is switched on — CSP_SCRIPT_SRC permits no inline scripts.
+  ---------------------------------------------------------------------- */
+  (function () {
+    var tabs = document.querySelectorAll("[data-report-tab]");
+    var panels = document.querySelectorAll("[data-report-panel]");
+    if (!tabs.length) return;
+
+    tabs.forEach(function (tab) {
+      tab.addEventListener("click", function () {
+        var target = tab.dataset.reportTab;
+        tabs.forEach(function (item) {
+          var active = item === tab;
+          item.classList.toggle("active", active);
+          item.setAttribute("aria-selected", active ? "true" : "false");
+        });
+        panels.forEach(function (panel) {
+          panel.classList.toggle("active", panel.dataset.reportPanel === target);
+        });
+      });
+    });
+  })();
+
+  /* ----------------------------------------------------------------------
+     Print trigger: any [data-print-trigger] button opens the print dialog.
+     Kept independent of the audit-logging block below — a page with a print
+     button but no [data-print-log] marker (or one added later without it)
+     must not end up with a button that silently does nothing.
+  ---------------------------------------------------------------------- */
+  document.addEventListener("click", function (event) {
+    if (event.target.closest && event.target.closest("[data-print-trigger]")) window.print();
+  });
+
+  /* ----------------------------------------------------------------------
+     In-place GET filters are enhanced in auto-filters.js. They use HTMX and
+     external listeners so Content-Security-Policy needs no inline handlers.
+  ---------------------------------------------------------------------- */
+  /* [data-reload]: the error page's "Try Again". It carried
+     onclick="window.location.reload()", which the Content-Security-Policy
+     refuses, so the button did nothing. */
+  document.addEventListener("click", function (event) {
+    if (event.target.closest && event.target.closest("[data-reload]")) {
+      window.location.reload();
+    }
+  });
+
+  /* ----------------------------------------------------------------------
+     Auto-print: a page that exists only to be printed opens the dialog on
+     arrival, so reaching it is one click rather than two.
+
+     Declared as a data attribute rather than an inline script because
+     django-csp allows no inline script content. On `load` rather than
+     immediately: printing before the stylesheet has applied lays the page out
+     with no styles at all, which is exactly what this page exists to avoid.
+
+     The tab is left open afterwards. `afterprint` fires when the dialog is
+     cancelled as well as when it prints, so closing on it would throw away the
+     memo of anybody who opened the dialog to look at the preview.
+  ---------------------------------------------------------------------- */
+  if (document.querySelector("[data-auto-print]")) {
+    window.addEventListener("load", function () { window.print(); });
+  }
+
+  /* ----------------------------------------------------------------------
+     Print auditing.
+     Printing happens entirely in the browser, so a paper copy would otherwise
+     leave no trace at all. Pages that opt in carry a [data-print-log] element;
+     opening a print dialog — via the button OR Ctrl+P — posts one entry.
+  ---------------------------------------------------------------------- */
+  (function () {
+    /* One entry per print dialog, not per page view: a user who prints twice
+       has produced two copies, but a dialog they cancel is still an attempt
+       worth recording once. */
+    var logging = false;
+
+    function recordPrint() {
+      var marker = document.querySelector("[data-print-log]");
+      if (!marker) return;
+      var url = marker.dataset.printLogUrl;
+      var token = marker.dataset.printLogCsrf;
+      if (!url || !token) return;
+      if (logging) return;
+      logging = true;
+      window.setTimeout(function () { logging = false; }, 2000);
+
+      var body = new URLSearchParams();
+      body.set("label", marker.dataset.printLog || "a page");
+      body.set("reference", marker.dataset.printLogReference || "");
+      body.set("target_type", marker.dataset.printLogTargetType || "");
+      body.set("target_id", marker.dataset.printLogTargetId || "");
+
+      window.fetch(url, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: {
+          "X-CSRFToken": token,
+          "Content-Type": "application/x-www-form-urlencoded",
+        },
+        body: body.toString(),
+        keepalive: true,  // the tab may close the moment printing finishes
+      }).catch(function () {
+        /* Auditing must never break printing. A failed entry is logged
+           server-side on the next successful request instead. */
+      });
+    }
+
+    if ("onbeforeprint" in window) {
+      window.addEventListener("beforeprint", recordPrint);
+    } else if (window.matchMedia) {
+      /* Safari has no beforeprint event; its print stylesheet media query
+         flips instead. */
+      var printQuery = window.matchMedia("print");
+      printQuery.addEventListener("change", function (event) {
+        if (event.matches) recordPrint();
+      });
+    }
+  })();
+
+  /* ----------------------------------------------------------------------
+     Character counter for any textarea that carries a maxlength.
+
+     The browser silently refuses the keystroke past the limit, which reads as
+     a broken keyboard if nothing on screen says why. Driven off the attribute
+     rather than a list of field names, so a box gains a counter the moment its
+     form field gains a ceiling.
+  ---------------------------------------------------------------------- */
+  document.querySelectorAll("textarea[maxlength]").forEach(function (box) {
+    var limit = parseInt(box.getAttribute("maxlength"), 10);
+    if (!limit) return;
+
+    var readout = document.createElement("div");
+    readout.className = "char-count";
+    /* Announced only when it starts mattering, not on every keystroke. */
+    readout.setAttribute("aria-live", "polite");
+    box.insertAdjacentElement("afterend", readout);
+
+    function update() {
+      var used = box.value.length;
+      var left = limit - used;
+      readout.textContent = used + " / " + limit;
+      readout.classList.toggle("is-near", left <= limit * 0.1 && left > 0);
+      readout.classList.toggle("is-full", left <= 0);
+      readout.textContent = left <= 0
+        ? limit + " / " + limit + " — limit reached"
+        : used + " / " + limit;
+    }
+
+    box.addEventListener("input", update);
+    update();
+  });
+
+  /* ----------------------------------------------------------------------
+     Folded history (<details class="fold">).
+
+     The markup ships open, so with this script blocked the whole record is
+     still readable — hiding is the enhancement, never the default. That is
+     also why printing reopens every fold: a paper copy of a routed document
+     has to carry the complete history whatever the screen happened to show.
+  ---------------------------------------------------------------------- */
+  (function () {
+    var folds = document.querySelectorAll("details.fold");
+    if (!folds.length) return;
+
+    folds.forEach(function (fold) {
+      if (!fold.hasAttribute("data-keep-open")) fold.open = false;
+    });
+
+    window.addEventListener("beforeprint", function () {
+      folds.forEach(function (fold) { fold.open = true; });
+    });
+  })();
+
+  /* ----------------------------------------------------------------------
+     Metadata review: suggested-tag chips append to the comma-separated box.
+     Here rather than inline in the template so it survives ENABLE_CSP.
+  ---------------------------------------------------------------------- */
+  (function () {
+    var marker = document.querySelector("[data-tag-chips]");
+    if (!marker) return;
+    var box = document.getElementById(marker.dataset.tagChipsInput || "");
+    if (!box) return;
+
+    document.querySelectorAll(".js-add-tag").forEach(function (chip) {
+      chip.addEventListener("click", function () {
+        var existing = box.value
+          .split(",")
+          .map(function (item) { return item.trim().toLowerCase(); })
+          .filter(Boolean);
+        var value = (chip.dataset.tag || "").toLowerCase();
+        if (value && existing.indexOf(value) === -1) {
+          existing.push(value);
+          box.value = existing.join(", ");
+        }
+        chip.classList.add("d-none");
+      });
+    });
+  })();
+
+  /* ----------------------------------------------------------------------
+     Idle sign-out warning.
+
+     The server is what ends the session; this is the courtesy that stops it
+     happening silently. Two rules shape the behaviour:
+
+     1. Working at the keyboard counts as being present, even with no page
+        loads. Typing a long remark sends nothing to the server, so without a
+        keep-alive the session would expire mid-sentence and take the text with
+        it. Activity therefore pings the server, throttled hard.
+     2. Once the warning is up, ambient activity is ignored and the button must
+        be pressed. A mouse nudged by a passer-by is not evidence that the
+        person who signed in has come back.
+  ---------------------------------------------------------------------- */
+  (function () {
+    var marker = document.querySelector("[data-session-timeout]");
+    if (!marker) return;
+
+    var idleSeconds = parseInt(marker.dataset.sessionTimeout, 10);
+    var warnAt = parseInt(marker.dataset.sessionWarnAt, 10);
+    var keepAliveUrl = marker.dataset.sessionKeepaliveUrl;
+    var loginUrl = marker.dataset.sessionLoginUrl;
+    var logoutUrl = marker.dataset.sessionLogoutUrl;
+    var token = marker.dataset.sessionCsrf;
+    if (!idleSeconds || !keepAliveUrl || !token || !loginUrl || !logoutUrl) return;
+    if (isNaN(warnAt) || warnAt <= 0 || warnAt >= idleSeconds) warnAt = 120;
+
+    /* Count towards a fixed deadline rather than decrementing, for the same
+       reason the lockout page does: background tabs get their timers throttled
+       and a decrementing counter falls behind real time. */
+    var deadline = Date.now() + idleSeconds * 1000;
+    var nextPingAllowedAt = 0;
+    var pingGap = Math.max(60, Math.floor(idleSeconds / 4)) * 1000;
+    var warning = null;
+    var clock = null;
+    var signedOut = false;
+
+    function secondsLeft() {
+      return Math.round((deadline - Date.now()) / 1000);
+    }
+
+    function pad(value) {
+      return (value < 10 ? "0" : "") + value;
+    }
+
+    function keepAlive() {
+      nextPingAllowedAt = Date.now() + pingGap;
+      return window.fetch(keepAliveUrl, {
+        method: "POST",
+        credentials: "same-origin",
+        headers: { "X-CSRFToken": token, "Content-Type": "application/x-www-form-urlencoded" },
+      })
+        .then(function (response) {
+          if (!response.ok) throw new Error("keep-alive refused");
+          return response.json();
+        })
+        .then(function (data) {
+          deadline = Date.now() + (data.seconds_remaining || idleSeconds) * 1000;
+          return true;
+        })
+        .catch(function () {
+          /* Offline or already signed out. Leave the deadline alone: the
+             countdown carries on and the redirect below is the safe landing. */
+          return false;
+        });
+    }
+
+    function buildWarning() {
+      var dialog = document.createElement("dialog");
+      dialog.className = "session-dialog";
+      dialog.setAttribute("aria-labelledby", "session-dialog-title");
+
+      var heading = document.createElement("h2");
+      heading.id = "session-dialog-title";
+      heading.textContent = "Still there?";
+
+      var body = document.createElement("p");
+      body.textContent =
+        "You are about to be signed out because the account has been idle. " +
+        "Anything you have typed but not saved will be lost.";
+
+      clock = document.createElement("div");
+      clock.className = "session-dialog__clock";
+      /* Not announced: a value changing every second would be read out
+         endlessly. Opening the dialog announces the heading and body. */
+      clock.setAttribute("aria-live", "off");
+
+      var actions = document.createElement("div");
+      actions.className = "session-dialog__actions";
+
+      var stay = document.createElement("button");
+      stay.type = "button";
+      stay.className = "btn btn-udm";
+      stay.textContent = "Stay signed in";
+      stay.addEventListener("click", function () {
+        stay.disabled = true;
+        keepAlive().then(function (ok) {
+          stay.disabled = false;
+          if (ok) {
+            hideWarning();
+          } else {
+            redirectToLogin();
+          }
+        });
+      });
+
+      var out = document.createElement("button");
+      out.type = "button";
+      out.className = "btn btn-udm-outline";
+      out.textContent = "Sign out now";
+      out.addEventListener("click", signOutNow);
+
+      actions.appendChild(stay);
+      actions.appendChild(out);
+      dialog.appendChild(heading);
+      dialog.appendChild(body);
+      dialog.appendChild(clock);
+      dialog.appendChild(actions);
+
+      /* Escape must not dismiss it. Closing the warning without answering
+         would leave the countdown running behind a page that looks fine. */
+      dialog.addEventListener("cancel", function (event) { event.preventDefault(); });
+
+      document.body.appendChild(dialog);
+      return dialog;
+    }
+
+    function showWarning() {
+      if (warning) return;
+      warning = buildWarning();
+      if (typeof warning.showModal === "function") {
+        warning.showModal();
+      } else {
+        warning.setAttribute("open", "open");  // very old browsers
+      }
+    }
+
+    function hideWarning() {
+      if (!warning) return;
+      if (typeof warning.close === "function") warning.close();
+      warning.remove();
+      warning = null;
+      clock = null;
+    }
+
+    /* Reached when the countdown runs out. Deliberately a navigation and not a
+       sign-out: the server, not this timer, decides when the session ends. If
+       the countdown is early — another tab has been keeping the session alive —
+       the sign-in page bounces the user harmlessly back, and the real expiry
+       still happens on the server's schedule. Forcing a sign-out here would let
+       an idle background tab end a session someone is actively working in. */
+    function redirectToLogin() {
+      if (signedOut) return;
+      signedOut = true;
+      var here = window.location.pathname + window.location.search;
+      /* The window this page counted down with, not a bare flag. Once the
+         session is gone the sign-in page has no way to tell whose it was, so
+         an administrator idled out at 15 minutes was told 30. The server
+         honours this only if it names a window it actually enforces. */
+      window.location.href =
+        loginUrl + "?timeout=" + idleSeconds + "&next=" + encodeURIComponent(here);
+    }
+
+    /* "Sign out now", on the other hand, has to actually sign out. Sending the
+       browser to the sign-in page does not: the view redirects an already
+       authenticated visitor straight back to `next`, so the button returned
+       the user to the page they were on, still signed in — the exact opposite
+       of what it said. LogoutView is POST-only, so this posts. */
+    function signOutNow() {
+      if (signedOut) return;
+      signedOut = true;
+      var form = document.createElement("form");
+      form.method = "post";
+      form.action = logoutUrl;
+      var field = document.createElement("input");
+      field.type = "hidden";
+      field.name = "csrfmiddlewaretoken";
+      field.value = token;
+      form.appendChild(field);
+      document.body.appendChild(form);
+      form.submit();
+    }
+
+    function tick() {
+      var left = secondsLeft();
+      if (left <= 0) {
+        redirectToLogin();
+        return;
+      }
+      if (left <= warnAt) {
+        showWarning();
+        if (clock) {
+          clock.textContent = Math.floor(left / 60) + ":" + pad(left % 60);
+        }
+      }
+    }
+
+    function onActivity() {
+      /* While the warning is up the button is the only way back. */
+      if (warning) return;
+      if (Date.now() < nextPingAllowedAt) return;
+      if (secondsLeft() <= warnAt) return;
+      keepAlive();
+    }
+
+    ["pointerdown", "keydown", "scroll", "focusin"].forEach(function (name) {
+      window.addEventListener(name, onActivity, { passive: true });
+    });
+
+    window.setInterval(tick, 1000);
+    tick();
+  })();
+
+  /* ----------------------------------------------------------------------
+     Search page: relevance readout + tag/title autocomplete.
+     Lives here rather than inline in the template so it still runs once
+     ENABLE_CSP is switched on — CSP_SCRIPT_SRC permits no inline scripts.
+     The template hands over the field ids and the endpoint on a marker,
+     so Django keeps ownership of both.
+  ---------------------------------------------------------------------- */
+  function enhanceSearch() {
+    var marker = document.querySelector("[data-search-enhance]");
+    if (!marker || marker.dataset.searchReady === "1") return;
+    marker.dataset.searchReady = "1";
+
+    var slider = document.getElementById(marker.dataset.searchRelevanceId || "");
+    var readout = document.getElementById("relevance-value");
+    var thresholdLabels = document.querySelectorAll("[data-relevance-threshold]");
+    if (slider) {
+      var syncRelevanceReadout = function () {
+        if (readout) readout.textContent = slider.value;
+        thresholdLabels.forEach(function (label) { label.textContent = slider.value; });
+      };
+      syncRelevanceReadout();
+      slider.addEventListener("input", syncRelevanceReadout);
+      slider.addEventListener("change", syncRelevanceReadout);
+    }
+
+    var box = document.getElementById(marker.dataset.searchQueryId || "");
+    var list = document.getElementById("search-suggestions");
+    var url = marker.dataset.searchAutocompleteUrl;
+    if (!box || !list || !url) return;
+
+    var timer = null;
+    box.addEventListener("input", function () {
+      window.clearTimeout(timer);
+      var value = box.value.trim();
+      if (value.length < 2) return;
+      timer = window.setTimeout(function () {
+        window.fetch(url + "?q=" + encodeURIComponent(value), { credentials: "same-origin" })
+          .then(function (response) { return response.json(); })
+          .then(function (data) {
+            list.innerHTML = "";
+            (data.results || []).forEach(function (term) {
+              var option = document.createElement("option");
+              option.value = term;
+              list.appendChild(option);
+            });
+          })
+          .catch(function () { /* suggestions are optional */ });
+      }, 220);
+    });
+  }
+  enhanceSearch();
+  document.addEventListener("htmx:afterSwap", enhanceSearch);
+  document.addEventListener("htmx:historyRestore", enhanceSearch);
+
+  /* ----------------------------------------------------------------------
+     Phase 6 mobile navigation and shared accessibility helpers.
+  ---------------------------------------------------------------------- */
+  var sidebarToggle = document.querySelector("[data-sidebar-toggle]");
+  var sidebar = document.getElementById("main-sidebar");
+  var sidebarClosers = document.querySelectorAll("[data-sidebar-close]");
+  var sidebarMain = document.querySelector(".app-main");
+
+  function sidebarIsMobile() {
+    return window.matchMedia("(max-width: 900px)").matches;
+  }
+
+  function sidebarFocusables() {
+    return Array.prototype.slice.call(sidebar.querySelectorAll(
+      'a[href], button:not([disabled]), input:not([disabled]), select:not([disabled]), textarea:not([disabled]), [tabindex]:not([tabindex="-1"])'
+    )).filter(function (element) { return !element.hidden && element.getClientRects().length; });
+  }
+
+  function setSidebarOpen(open, returnFocus) {
+    var mobile = sidebarIsMobile();
+    var wasOpen = document.body.classList.contains("sidebar-open");
+    open = Boolean(open && mobile);
+    document.body.classList.toggle("sidebar-open", open);
+    if (sidebarToggle) sidebarToggle.setAttribute("aria-expanded", open ? "true" : "false");
+    if (sidebar) {
+      sidebar.inert = mobile && !open;
+      if (sidebar.inert) sidebar.setAttribute("aria-hidden", "true");
+      else sidebar.removeAttribute("aria-hidden");
+    }
+    if (sidebarMain) sidebarMain.inert = open;
+    if (open && !wasOpen && sidebar) {
+      var firstLink = sidebar.querySelector("a, button");
+      if (firstLink) window.setTimeout(function () { firstLink.focus(); }, 0);
+    } else if (!open && mobile && sidebarToggle &&
+               (returnFocus || sidebar.contains(document.activeElement))) {
+      sidebarToggle.focus();
+    }
+  }
+
+  if (sidebarToggle && sidebar) {
+    setSidebarOpen(false);
+    sidebarToggle.addEventListener("click", function () { setSidebarOpen(true); });
+    sidebarClosers.forEach(function (closer) {
+      closer.addEventListener("click", function () { setSidebarOpen(false, true); });
+    });
+    sidebar.querySelectorAll("a").forEach(function (link) {
+      link.addEventListener("click", function () {
+        if (window.matchMedia("(max-width: 900px)").matches) setSidebarOpen(false);
+      });
+    });
+    document.addEventListener("keydown", function (event) {
+      if (!document.body.classList.contains("sidebar-open")) return;
+      // A native idle-warning dialog takes precedence over the drawer.
+      if (event.target && event.target.closest && event.target.closest("dialog[open]")) return;
+      if (event.key === "Escape") {
+        event.preventDefault();
+        setSidebarOpen(false, true);
+      } else if (event.key === "Tab") {
+        var items = sidebarFocusables();
+        var first = items[0];
+        var last = items[items.length - 1];
+        if (!first) return;
+        var outside = !sidebar.contains(document.activeElement);
+        if (event.shiftKey && (document.activeElement === first || outside)) {
+          event.preventDefault();
+          last.focus();
+        } else if (!event.shiftKey && (document.activeElement === last || outside)) {
+          event.preventDefault();
+          first.focus();
+        }
+      }
+    });
+    window.addEventListener("resize", function () {
+      setSidebarOpen(document.body.classList.contains("sidebar-open"));
+    });
+  }
+
+  document.querySelectorAll(".form-field--error input, .form-field--error select, .form-field--error textarea").forEach(function (field) {
+    field.setAttribute("aria-invalid", "true");
+  });
+
+  /* ----------------------------------------------------------------------
+     6. Keyboard shortcut: "/" focuses the top search box.
+  ---------------------------------------------------------------------- */
+  document.addEventListener("keydown", function (event) {
+    if (event.key !== "/" || event.ctrlKey || event.metaKey || event.altKey) return;
+    var tag = (event.target.tagName || "").toLowerCase();
+    if (tag === "input" || tag === "textarea" || tag === "select") return;
+    var box = document.querySelector(".topbar-search input");
+    if (box) {
+      event.preventDefault();
+      box.focus();
+    }
+  });
+
+  /* ----------------------------------------------------------------------
+     6. Sign-in lockout countdown (templates/accounts/lockout.html).
+     Lives here rather than inline in the template so it still runs once
+     ENABLE_CSP is switched on — CSP_SCRIPT_SRC permits no inline scripts.
+  ---------------------------------------------------------------------- */
+  (function () {
+    var wrap = document.querySelector("[data-lockout-seconds]");
+    if (!wrap) return;
+
+    var clock = wrap.querySelector("[data-lockout-clock]");
+    var status = wrap.querySelector("[data-lockout-status]");
+    var heading = document.querySelector("[data-lockout-heading]");
+    if (!clock) return;
+
+    var seconds = parseInt(wrap.dataset.lockoutSeconds, 10);
+    if (isNaN(seconds) || seconds < 0) seconds = 0;
+
+    /* Count towards a fixed deadline instead of subtracting a second per tick.
+       Browsers throttle timers in background tabs, so a decrementing counter
+       falls behind real time — and this countdown is meant to read the same
+       everywhere, including on a device that sat in the background. */
+    var deadline = Date.now() + seconds * 1000;
+    var timer = null;
+
+    function pad(value) {
+      return (value < 10 ? "0" : "") + value;
+    }
+
+    /* Waits reach hours at the higher lockout stages, where "120:00" would be
+       nonsense — show HH:MM:SS once past an hour. */
+    function format(total) {
+      var hours = Math.floor(total / 3600);
+      var minutes = Math.floor((total % 3600) / 60);
+      return (hours > 0 ? pad(hours) + ":" : "") + pad(minutes) + ":" + pad(total % 60);
+    }
+
+    function finish() {
+      clock.textContent = format(0);
+      if (heading) heading.textContent = "Sign-in is unlocked";
+      if (status) status.textContent = "The waiting time is over. You can try signing in again.";
+      var back = wrap.dataset.lockoutRedirect;
+      if (back) window.setTimeout(function () { window.location.href = back; }, 1500);
+    }
+
+    function tick() {
+      var left = Math.round((deadline - Date.now()) / 1000);
+      if (left <= 0) {
+        if (timer) window.clearInterval(timer);
+        finish();
+        return;
+      }
+      clock.textContent = format(left);
+    }
+
+    tick();
+    if (seconds > 0) timer = window.setInterval(tick, 1000);
+  })();
+})();
+
+/* --------------------------------------------------------------------------
+   Theme (dark mode)
+
+   The stylesheet themes off one attribute, [data-theme], rather than off
+   prefers-color-scheme — so the operating-system preference is resolved here
+   and written to the same attribute a person's explicit choice writes to. That
+   keeps a single palette in the CSS instead of two copies that drift, and it
+   makes an explicit choice beat the OS, which is the behaviour people expect
+   from a toggle they can see.
+
+   Set on the whole document, and harmless on the pages that stay light: the
+   sign-in and lockout screens, the routing slip and the printed memo take the
+   light palette back in CSS, and carry data-bs-theme="light" for Bootstrap.
+
+   The first paint is handled by static/js/theme-init.js, a small external
+   script in <head> (so the CSP's script-src 'self' covers it): it sets the
+   theme before the stylesheets apply, where this file, loaded at the end of
+   <body>, left a dark-preferring reader a light flash on every page. This file
+   keeps the toggle and the operating-system follow, and writes the same two
+   attributes: data-theme for the app's stylesheet, data-bs-theme for
+   Bootstrap's own components.
+-------------------------------------------------------------------------- */
+(function () {
+  "use strict";
+
+  var STORAGE_KEY = "doctrack-theme";
+  var root = document.documentElement;
+
+  function stored() {
+    /* Private browsing and blocked site data both throw on access rather than
+       returning null, so every read and write is guarded. A viewer with
+       storage blocked simply gets the OS preference each visit. */
+    try {
+      var value = window.localStorage.getItem(STORAGE_KEY);
+      return value === "dark" || value === "light" ? value : null;
+    } catch (error) {
+      return null;
+    }
+  }
+
+  function remember(value) {
+    try {
+      window.localStorage.setItem(STORAGE_KEY, value);
+    } catch (error) {
+      /* Nothing to do: the choice still applies for this page view. */
+    }
+  }
+
+  function prefersDark() {
+    return window.matchMedia && window.matchMedia("(prefers-color-scheme: dark)").matches;
+  }
+
+  function apply(theme) {
+    root.setAttribute("data-theme", theme);
+    root.setAttribute("data-bs-theme", theme);
+    var toggles = document.querySelectorAll("[data-theme-toggle]");
+    var next = theme === "dark" ? "light" : "dark";
+    var label = "Switch to " + next + " theme";
+    for (var i = 0; i < toggles.length; i++) {
+      toggles[i].setAttribute("aria-label", label);
+      toggles[i].setAttribute("title", label);
+      toggles[i].setAttribute("aria-pressed", theme === "dark" ? "true" : "false");
+    }
+  }
+
+  var choice = stored();
+  apply(choice || (prefersDark() ? "dark" : "light"));
+
+  document.addEventListener("click", function (event) {
+    var button = event.target.closest && event.target.closest("[data-theme-toggle]");
+    if (!button) return;
+    var next = root.getAttribute("data-theme") === "dark" ? "light" : "dark";
+    apply(next);
+    remember(next);
+  });
+
+  /* Follow the operating system while nobody has chosen. Once someone presses
+     the toggle their choice is stored, and this stops overriding it. */
+  if (window.matchMedia) {
+    var query = window.matchMedia("(prefers-color-scheme: dark)");
+    var onChange = function (event) {
+      if (!stored()) apply(event.matches ? "dark" : "light");
+    };
+    if (query.addEventListener) query.addEventListener("change", onChange);
+    else if (query.addListener) query.addListener(onChange);
+  }
+})();
+
+/* --------------------------------------------------------------------------
+   Ring slices
+
+   The rings are aria-hidden SVG; the legend beside each one is the accessible
+   path to its figures and links. This is the pointer's way into the same
+   figures: point at a slice for its count, label and share, and follow it the
+   way its legend row would be followed.
+
+   - Mouse or pen: hovering shows the tooltip, clicking follows the slice.
+   - Touch has no hover, so the first tap shows the tooltip and a second tap
+     on the same slice follows it. A tap anywhere else puts it away.
+   - Hovering or focusing a legend row lights up its slice, so a keyboard
+     user tabbing through the legend sees which slice each row is.
+
+   One set of delegated listeners on the document, so a ring rendered later (or
+   more than one ring on a page) needs no setup of its own. Labels are written
+   with textContent: they are data, not markup.
+-------------------------------------------------------------------------- */
+(function () {
+  "use strict";
+
+  var active = null;
+  var pointerType = "mouse";
+
+  function layoutOf(node) {
+    return node && node.closest ? node.closest(".donut-layout") : null;
+  }
+
+  function sliceIn(layout, key) {
+    var slices = layout.querySelectorAll(".donut-slice");
+    for (var i = 0; i < slices.length; i++) {
+      if (slices[i].getAttribute("data-slice") === key) return slices[i];
+    }
+    return null;
+  }
+
+  function clear() {
+    if (!active) return;
+    var layout = layoutOf(active);
+    active.classList.remove("is-active");
+    if (layout) {
+      layout.classList.remove("has-active-slice");
+      var lit = layout.querySelectorAll(".breakdown-item.is-active");
+      for (var i = 0; i < lit.length; i++) lit[i].classList.remove("is-active");
+      var tip = layout.querySelector(".donut-tooltip");
+      if (tip) tip.hidden = true;
+    }
+    active = null;
+  }
+
+  function activate(slice) {
+    if (active === slice) return;
+    clear();
+    var layout = layoutOf(slice);
+    if (!layout) return;
+    active = slice;
+    slice.classList.add("is-active");
+    layout.classList.add("has-active-slice");
+    var items = layout.querySelectorAll(".breakdown-item[data-slice]");
+    for (var i = 0; i < items.length; i++) {
+      if (items[i].getAttribute("data-slice") === slice.getAttribute("data-slice")) {
+        items[i].classList.add("is-active");
+      }
+    }
+  }
+
+  function showTooltip(slice, clientX, clientY) {
+    activate(slice);
+    var layout = layoutOf(slice);
+    var tip = layout && layout.querySelector(".donut-tooltip");
+    if (!tip) return;
+    tip.querySelector(".donut-tooltip-key").style.background = slice.style.fill;
+    tip.querySelector("strong").textContent = slice.getAttribute("data-count");
+    tip.querySelector("span").textContent =
+      slice.getAttribute("data-label") + " \u00b7 " + slice.getAttribute("data-percent") + "%";
+    tip.hidden = false;
+
+    /* Above the pointer, centred on it, kept inside the ring's own panel so the
+       card's clipped edge never cuts it. Below the pointer when there is no
+       room above. */
+    var box = layout.getBoundingClientRect();
+    var width = tip.offsetWidth;
+    var height = tip.offsetHeight;
+    var x = clientX - box.left;
+    var y = clientY - box.top;
+    var left = Math.max(0, Math.min(x - width / 2, box.width - width));
+    var top = y - height - 12;
+    if (top < 0) top = y + 18;
+    tip.style.left = left + "px";
+    tip.style.top = top + "px";
+  }
+
+  function follow(slice) {
+    var href = slice.getAttribute("data-href");
+    if (href) window.location.assign(href);
+  }
+
+  document.addEventListener("pointerdown", function (event) {
+    pointerType = event.pointerType || "mouse";
+  });
+
+  document.addEventListener("pointermove", function (event) {
+    if (event.pointerType === "touch") return;
+    var slice = event.target.closest && event.target.closest(".donut-slice");
+    if (slice) showTooltip(slice, event.clientX, event.clientY);
+  });
+
+  document.addEventListener("pointerout", function (event) {
+    if (event.pointerType === "touch" || !active) return;
+    var into = event.relatedTarget;
+    if (event.target.closest && event.target.closest(".donut-slice") &&
+        !(into && into.closest && into.closest(".donut-slice"))) {
+      clear();
+    }
+  });
+
+  document.addEventListener("click", function (event) {
+    var slice = event.target.closest && event.target.closest(".donut-slice");
+    if (!slice) {
+      if (pointerType === "touch") clear();
+      return;
+    }
+    if (pointerType === "touch" && active !== slice) {
+      showTooltip(slice, event.clientX, event.clientY);
+      return;
+    }
+    follow(slice);
+  });
+
+  function fromLegend(event, on) {
+    var item = event.target.closest && event.target.closest(".breakdown-item[data-slice]");
+    var layout = layoutOf(item);
+    if (!item || !layout) return;
+    if (!on) {
+      /* Moving between the label and the count inside one row is not leaving
+         the row. */
+      var into = event.relatedTarget;
+      if (into && into.closest && into.closest(".breakdown-item") === item) return;
+      clear();
+      return;
+    }
+    var slice = sliceIn(layout, item.getAttribute("data-slice"));
+    if (slice) activate(slice);
+  }
+
+  document.addEventListener("mouseover", function (event) { fromLegend(event, true); });
+  document.addEventListener("mouseout", function (event) { fromLegend(event, false); });
+  document.addEventListener("focusin", function (event) { fromLegend(event, true); });
+  document.addEventListener("focusout", function (event) { fromLegend(event, false); });
+
+  document.addEventListener("keydown", function (event) {
+    if (event.key === "Escape") clear();
+  });
+
+  /* The Tracking card's Status | Overdue switch. Both views are already on the
+     page; this shows one and hides the other, and keeps the address and the
+     office picker in step so a refresh, a shared link or a change of office
+     keeps the view. The links still work with scripting off, by loading the
+     page with ?ring= set. */
+  document.addEventListener("click", function (event) {
+    var link = event.target.closest && event.target.closest("[data-ring-view]");
+    var card = link && link.closest("[data-ring-card]");
+    if (!card) return;
+    event.preventDefault();
+    clear();
+    var view = link.getAttribute("data-ring-view");
+    var panels = card.querySelectorAll("[data-ring-panel]");
+    for (var i = 0; i < panels.length; i++) {
+      panels[i].hidden = panels[i].getAttribute("data-ring-panel") !== view;
+    }
+    var options = card.querySelectorAll("[data-ring-view]");
+    for (var k = 0; k < options.length; k++) {
+      var on = options[k] === link;
+      options[k].classList.toggle("is-active", on);
+      if (on) options[k].setAttribute("aria-current", "true");
+      else options[k].removeAttribute("aria-current");
+    }
+    var inputs = document.querySelectorAll("[data-ring-view-input]");
+    for (var n = 0; n < inputs.length; n++) inputs[n].disabled = view !== "overdue";
+    if (window.history && window.history.replaceState) {
+      window.history.replaceState(null, "", link.getAttribute("href"));
+    }
+  });
+})();
+
+/* --------------------------------------------------------------------------
+   Column values: flat when they fit, turned when they do not
+
+   Every bar on a column chart carries its number. Flat numbers read best, but
+   three of them over one month need room the month may not have, and whether
+   it does depends on the chart's width, how many series it draws and how many
+   digits its biggest number runs to. So it is measured: lay the numbers out
+   flat, and if any two touch, turn them all on their side. A turned number is
+   no wider than its bar, so turned numbers cannot touch.
+
+   Re-measured when a chart changes width, and turned for printing, where the
+   page width is not the screen's and there is no second chance to measure.
+-------------------------------------------------------------------------- */
+(function () {
+  "use strict";
+
+  var charts = [];
+
+  function touching(chart) {
+    var labels = chart.querySelectorAll(".column-value");
+    var previous = null;
+    for (var i = 0; i < labels.length; i++) {
+      var box = labels[i].getBoundingClientRect();
+      if (!box.width) continue; /* the chart is hidden: nothing to measure */
+      if (previous && box.left < previous.right + 2) return true;
+      previous = box;
+    }
+    return false;
+  }
+
+  function fit(chart) {
+    chart.classList.add("column-chart--measured");
+    chart.classList.remove("column-chart--turned");
+    if (touching(chart)) chart.classList.add("column-chart--turned");
+  }
+
+  function fitAll() {
+    for (var i = 0; i < charts.length; i++) fit(charts[i]);
+  }
+
+  function enhanceCharts() {
+    if (observer) observer.disconnect();
+    charts = document.querySelectorAll(".column-chart");
+    fitAll();
+    if (observer) charts.forEach(function (chart) { observer.observe(chart); });
+  }
+  if (document.fonts && document.fonts.ready) document.fonts.ready.then(fitAll);
+
+  var observer = null;
+  if (window.ResizeObserver) {
+    var widths = new WeakMap();
+    observer = new ResizeObserver(function (entries) {
+      for (var i = 0; i < entries.length; i++) {
+        var chart = entries[i].target;
+        var width = Math.round(entries[i].contentRect.width);
+        if (widths.get(chart) === width) continue;
+        widths.set(chart, width);
+        fit(chart);
+      }
+    });
+  }
+  enhanceCharts();
+  document.addEventListener("htmx:afterSwap", enhanceCharts);
+  document.addEventListener("htmx:historyRestore", enhanceCharts);
+
+  window.addEventListener("beforeprint", function () {
+    for (var i = 0; i < charts.length; i++) charts[i].classList.add("column-chart--turned");
+  });
+  window.addEventListener("afterprint", fitAll);
+})();
+
+/* --------------------------------------------------------------------------
+   Turnaround chart: a month at a time, by touch and by keyboard
+
+   Pointing at a month is CSS alone (:hover). This adds the two ways a pointer
+   cannot: a tap on a touch screen shows that month (a second tap, or a tap
+   elsewhere, puts it away), and the chart is one tab stop whose left and right
+   arrow keys walk the months, each read out through a polite live region.
+-------------------------------------------------------------------------- */
+(function () {
+  "use strict";
+
+  function monthsOf(box) {
+    return Array.prototype.slice.call(box.querySelectorAll("[data-trend-month]"));
+  }
+
+  function fitTip(box, month) {
+    var tip = month && month.querySelector(".trend-tip");
+    if (!tip) return;
+    var plot = box.getBoundingClientRect();
+    var hit = month.getBoundingClientRect();
+    tip.style.minWidth = Math.min(200, plot.width) + "px";
+    tip.style.maxWidth = Math.min(260, plot.width) + "px";
+    var centre = hit.left + hit.width / 2;
+    var preferred = month.classList.contains("trend-hit--left")
+      ? centre - tip.offsetWidth - 12 : centre + 12;
+    // Short windows have wider month targets. Keep their popup inside the
+    // plot too, especially when only one or three months fit on a phone.
+    var left = Math.max(plot.left, Math.min(preferred, plot.right - tip.offsetWidth));
+    tip.style.left = (left - hit.left) + "px";
+    tip.style.right = "auto";
+  }
+
+  function show(box, month) {
+    box.classList.toggle("is-dismissed", !month);
+    monthsOf(box).forEach(function (each) {
+      each.classList.toggle("is-active", each === month);
+    });
+    fitTip(box, month);
+    var live = box.querySelector("[data-trend-announce]");
+    if (live) live.textContent = month ? month.getAttribute("aria-label") : "";
+  }
+
+  function clearAll(except) {
+    var boxes = document.querySelectorAll("[data-trend-hover]");
+    for (var i = 0; i < boxes.length; i++) {
+      if (boxes[i] !== except) show(boxes[i], null);
+    }
+  }
+
+  // Pointer focus must not select the last date before its click is handled:
+  // clicking that date would otherwise immediately toggle it closed.
+  var pointerFocus = null;
+  document.addEventListener("pointerdown", function (event) {
+    pointerFocus = event.target.closest && event.target.closest("[data-trend-hover]");
+  });
+
+  document.addEventListener("click", function (event) {
+    pointerFocus = null;
+    var month = event.target.closest && event.target.closest("[data-trend-month]");
+    if (!month) {
+      clearAll(null);
+      return;
+    }
+    var box = month.closest("[data-trend-hover]");
+    clearAll(box);
+    show(box, month.classList.contains("is-active") ? null : month);
+  });
+
+  /* Moving to another date releases a selection. Moving inside the selected
+     date keeps it selected so the next click can close it reliably. */
+  document.addEventListener("pointerover", function (event) {
+    if (event.pointerType !== "mouse") return;
+    var box = event.target.closest && event.target.closest("[data-trend-hover]");
+    var month = event.target.closest && event.target.closest("[data-trend-month]");
+    var selected = box && box.querySelector(".is-active");
+    if (selected && selected !== month) show(box, null);
+    if (box) box.classList.remove("is-dismissed");
+    if (box && month) fitTip(box, month);
+  });
+
+  document.addEventListener("pointermove", function (event) {
+    if (event.pointerType !== "mouse") return;
+    var box = event.target.closest && event.target.closest("[data-trend-hover]");
+    if (!box) return;
+    var month = event.target.closest && event.target.closest("[data-trend-month]");
+    var selected = box.querySelector(".is-active");
+    if (selected && selected !== month) show(box, null);
+    box.classList.remove("is-dismissed");
+    if (month) fitTip(box, month);
+  });
+
+  window.addEventListener("resize", function () {
+    document.querySelectorAll("[data-trend-hover]").forEach(function (box) {
+      var month = box.querySelector(".is-active, .trend-hit:hover");
+      if (month) fitTip(box, month);
+    });
+  });
+
+  document.addEventListener("keydown", function (event) {
+    var box = event.target.closest && event.target.closest("[data-trend-hover]");
+    if (!box) return;
+    var months = monthsOf(box);
+    if (!months.length) return;
+    var current = months.findIndex(function (month) { return month.classList.contains("is-active"); });
+    var next = null;
+    if (event.key === "ArrowRight") next = current < 0 ? months.length - 1 : Math.min(months.length - 1, current + 1);
+    else if (event.key === "ArrowLeft") next = current < 0 ? months.length - 1 : Math.max(0, current - 1);
+    else if (event.key === "Home") next = 0;
+    else if (event.key === "End") next = months.length - 1;
+    else if (event.key === "Escape") { show(box, null); return; }
+    if (next === null) return;
+    event.preventDefault();
+    show(box, months[next]);
+  });
+
+  document.addEventListener("focusin", function (event) {
+    var box = event.target.matches && event.target.matches("[data-trend-hover]") ? event.target : null;
+    if (box && box !== pointerFocus && !box.querySelector(".is-active")) {
+      var months = monthsOf(box);
+      show(box, months[months.length - 1]);
+    }
+    pointerFocus = null;
+  });
+
+  document.addEventListener("focusout", function (event) {
+    var box = event.target.matches && event.target.matches("[data-trend-hover]") ? event.target : null;
+    if (box && !box.contains(event.relatedTarget)) show(box, null);
+  });
+})();

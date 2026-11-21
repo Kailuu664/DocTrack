@@ -1,0 +1,15 @@
+{% comment %}
+  The month a turnaround figure answers for. A plain GET form: every other
+  filter on the page rides along as a hidden field, so picking a month keeps
+  the office. Selections update in place, with Show as a no-script fallback.
+
+  Expects `picker` (core.filters.month_picker) and `picker_id`, unique on the page.
+{% endcomment %}
+<form id="{{ picker_id }}-filter" class="month-picker no-print" method="get" action="" {% include "partials/_auto_filter_attrs.html" with filter_mode="change" filter_sync="reports" %}>
+  {% for key, value in picker.keep %}<input type="hidden" name="{{ key }}" value="{{ value }}">{% endfor %}
+  <label class="month-picker-label" for="{{ picker_id }}">Month</label>
+  <select class="form-select form-select-sm" id="{{ picker_id }}" name="{{ picker.param }}">
+    {% for option in picker.options %}<option value="{{ option.value }}"{% if option.selected %} selected{% endif %}>{{ option.label }}</option>{% endfor %}
+  </select>
+  <button class="btn btn-sm btn-udm-outline" type="submit" data-filter-fallback>Show</button>
+</form>

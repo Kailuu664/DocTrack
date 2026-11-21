@@ -1,0 +1,54 @@
+<header class="app-topbar no-print">
+  <button
+    class="sidebar-toggle"
+    type="button"
+    data-sidebar-toggle
+    aria-controls="main-sidebar"
+    aria-expanded="false"
+    aria-label="Open navigation"
+  >
+    <span aria-hidden="true"></span><span aria-hidden="true"></span><span aria-hidden="true"></span>
+  </button>
+
+  <form class="topbar-search" action="{% url 'search:index' %}" method="get" role="search">
+    <label class="visually-hidden" for="topbar-search-input">Search the repository</label>
+    <input id="topbar-search-input" type="search" name="q" value="{{ request.GET.q|default:'' }}" placeholder="Search the repository" aria-label="Search the repository" autocomplete="off">
+  </form>
+
+  <div class="topbar-controls ms-auto d-flex align-items-center">
+    <button class="page-help-launch" type="button" data-page-help-open hidden
+            aria-controls="page-help-panel" aria-label="Open page guide">
+      {% include "partials/_help_icon.html" %}<span class="d-none d-sm-inline">Help</span>
+    </button>
+    {% comment %}
+      Dark mode, inside the app only. The icon and the label both name what
+      pressing it switches *to*, rather than what is currently on — a toggle
+      labelled with its own state is the classic ambiguity here.
+    {% endcomment %}
+    <button class="theme-toggle no-print" type="button" data-theme-toggle
+            aria-label="Switch to dark theme" title="Switch to dark theme">
+      <span class="theme-icon-light" aria-hidden="true">&#9789;</span>
+      <span class="theme-icon-dark" aria-hidden="true">&#9788;</span>
+    </button>
+    {% include "partials/_notification_badge.html" %}
+    <div class="dropdown">
+      <button type="button" class="topbar-account-button" data-bs-toggle="dropdown" aria-expanded="false" aria-label="Open account menu">
+        <span class="avatar">{{ user.initials }}</span>
+        <span class="topbar-account-copy d-none d-md-flex">
+          <span class="topbar-account-name">{{ user.short_display }}</span>
+          <span class="topbar-account-office">{{ user.office_label }}</span>
+        </span>
+        <span class="topbar-account-arrow d-none d-md-inline" aria-hidden="true">&#9662;</span>
+      </button>
+      <ul class="dropdown-menu dropdown-menu-end account-dropdown">
+        <li><div class="dropdown-item-text account-dropdown-header"><div class="account-dropdown-name">{{ user.display_name|default:user.username }}</div><div class="small text-muted">{{ user.office_label }}</div><div class="small text-muted">{{ user.get_role_display }}</div></div></li>
+        <li><hr class="dropdown-divider"></li>
+        <li><a class="dropdown-item" href="{% url 'accounts:profile' %}">My Profile</a></li>
+        <li><a class="dropdown-item" href="{% url 'accounts:password_change' %}">Change Password</a></li>
+        {% if user.is_superuser %}<li><a class="dropdown-item" href="{% url 'admin:index' %}">Django Administration</a></li>{% endif %}
+        <li><hr class="dropdown-divider"></li>
+        <li><form method="post" action="{% url 'accounts:logout' %}">{% csrf_token %}<button type="submit" class="dropdown-item account-signout">Sign Out</button></form></li>
+      </ul>
+    </div>
+  </div>
+</header>

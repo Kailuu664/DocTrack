@@ -1,0 +1,285 @@
+{% extends "base.html" %}
+{% load doctrack %}
+{% block title %}{{ record.display_tracking_number }} · {{ SITE_NAME }}{% endblock %}
+{% block content %}
+<div class="workspace-detail-page tracking-detail-page">
+
+<div class="page-head">
+  <div>
+    <div class="eyebrow">Tracking Record</div>
+    <h1>{{ record.subject }}</h1>
+    <p class="sub">
+      <span class="mono">{{ record.display_tracking_number }}</span>
+      {% include "partials/_direction_tag.html" with direction=record.direction %}
+      <span class="text-muted small">{{ stage_scope_label }}</span>
+      {% include "partials/_status_pill.html" with status=record.display_status %}{% include "partials/_overdue_tag.html" with overdue=record.is_overdue %}
+      {% if record.priority == "URGENT" %}<span class="pill pill-overdue">Urgent</span>{% endif %}
+    </p>
+  </div>
+  <div class="page-actions no-print">
+    {% if can_confirm or can_act or can_archive_now or can_reopen %}
+      <a class="btn btn-udm-outline d-lg-none" href="#tracking-record-actions">Go to document actions</a>
+    {% endif %}
+    {% if record.status == "DRAFT" %}
+      <a class="btn btn-udm" href="{% url 'tracking:review' record.pk %}">Review and send draft</a>
+    {% endif %}
+    {% if record.has_tracking_number %}
+      <a class="btn btn-udm-outline" href="{{ routing_slip_url }}" target="_blank" rel="noopener">Print routing slip</a>
+    {% endif %}
+    {% if archived_document %}
+      <a class="btn btn-udm-teal" href="{{ archived_document.get_absolute_url }}">Open archived record</a>
+    {% endif %}
+  </div>
+</div>
+
+<div class="row g-4 tracking-detail-layout">
+  <div class="col-lg-4 tracking-record-context">
+    <div class="card-udm">
+      <div class="card-udm-head"><h2>Document information</h2></div>
+      <div class="card-udm-body">
+        <table class="table table-sm table-stacked mb-0">
+          {% comment %}
+            Three offices matter, and the page used to name two. "Current" is
+            where the document is; "Receiving" is who owes the next act, which
+            is what a reader opening this page usually wants — and on a batch
+            sent to several offices it is the only row that says who they are.
+          {% endcomment %}
+          <tr><th class="text-muted fw-normal">Originating office</th><td>{% include "partials/_office_badge.html" with office=record.originating_office %}</td></tr>
+          <tr><th class="text-muted fw-normal">Received by</th>
+              <td class="office-cell" data-receipt-offices="received">{% include "partials/_receipt_offices.html" with kind="received" all_offices=True %}</td></tr>
+          <tr><th class="text-muted fw-normal">Awaiting receipt</th>
+              <td class="office-cell" data-receipt-offices="pending">{% include "partials/_receipt_offices.html" with kind="pending" all_offices=True %}</td></tr>
+          {# "Pending Receipt" here read as a person's name. It is not one. #}
+          <tr><th class="text-muted fw-normal">Latest receipt by</th>
+              <td>{% if record.confirmed_receipt_offices %}{{ record.current_holder.display_name|default:"Not recorded" }}{% else %}No receipts confirmed{% endif %}</td></tr>
+          <tr><th class="text-muted fw-normal">Created</th><td>{{ record.created_at|date:"d M Y, g:i A" }}</td></tr>
+          <tr><th class="text-muted fw-normal">Document types</th><td>{% include "partials/_document_types_display.html" with item=record %}</td></tr>
+          <tr><th class="text-muted fw-normal">Requested action</th>
+              <td>{{ record.get_requested_action_display|default:"Not specified" }}</td></tr>
+          <tr><th class="text-muted fw-normal">Classification</th><td>{{ record.get_classification_display }}</td></tr>
+          <tr><th class="text-muted fw-normal">Deadline</th>
+              <td>{% if record.due_at %}{{ record.due_at|date:"d M Y" }}, {% if record.due_at|date:"H:i:s" == "23:59:59" %}end of day{% else %}{{ record.due_at|date:"g:i A" }}{% endif %}{% if record.is_overdue %} <span class="pill pill-overdue">Overdue</span>{% endif %}{% else %}None{% endif %}</td></tr>
+          <tr><th class="text-muted fw-normal">Attachments</th><td>{{ attachments|length }} file{{ attachments|length|pluralize }}</td></tr>
+        </table>
+      </div>
+    </div>
+
+    <div class="card-udm mt-4 tracking-record-files">
+      <div class="card-udm-head"><h2>Files</h2></div>
+      <div class="card-udm-body">
+        {% include "partials/_file_versions.html" %}
+      </div>
+    </div>
+
+    {% if pending_offices %}
+      <div class="help-note mt-3">
+        Waiting for receipt from:
+        {% for office in pending_offices %}{% include "partials/_office_badge.html" with office=office %}{% endfor %}
+      </div>
+    {% endif %}
+  </div>
+
+  <div class="col-lg-8 tracking-record-work">
+    <div class="tracking-record-actions" id="tracking-record-actions" tabindex="-1">
+    {% if record.status == "DRAFT" and record.created_by_id == user.pk %}
+      <div class="card-udm mt-4"><div class="card-udm-body d-flex flex-wrap justify-content-between align-items-center gap-3">
+        <div><strong>This record is still a draft.</strong><div class="text-muted small">Nobody else can see it until it is routed.</div></div>
+        <a class="btn btn-udm" href="{% url 'tracking:review' record.pk %}">Continue to review</a>
+      </div></div>
+    {% endif %}
+
+    {% if can_confirm %}
+      <div class="card-udm mt-4 no-print">
+        <div class="card-udm-head"><h2>Confirm Document Receipt</h2></div>
+        <div class="card-udm-body">
+          <p class="text-muted body-copy">
+            This records that <strong>{{ user.office.name }}</strong> has taken custody of
+            <span class="mono">{{ record.display_tracking_number }}</span>. The server writes the exact date and time —
+            not a value you type.
+          </p>
+          <form method="post" action="{{ record_action_urls.confirm_receipt }}">
+            {% csrf_token %}
+            {% include "partials/_field.html" with field=receipt_form.note %}
+            <button class="btn btn-receipt" type="submit">
+              <span class="btn-receipt-icon" aria-hidden="true">✓</span>
+              <span>Confirm Receipt</span>
+            </button>
+          </form>
+        </div>
+      </div>
+    {% endif %}
+
+    {% if can_act %}
+      <div class="card-udm mt-4 no-print">
+        <div class="card-udm-head"><h2>Act on this document</h2></div>
+        <div class="card-udm-body">
+          <ul class="nav nav-tabs mb-3" role="tablist">
+            {% if access.tracking.work %}<li class="nav-item" role="presentation"><button class="nav-link{% if action_tab == "work" %} active{% endif %}" id="tab-remark-button" data-bs-toggle="tab" data-bs-target="#tab-remark" type="button" role="tab" aria-controls="tab-remark" aria-selected="{% if action_tab == "work" %}true{% else %}false{% endif %}"{% if action_tab != "work" %} tabindex="-1"{% endif %}>Add remark</button></li>{% endif %}
+            {% if access.tracking.endorse %}<li class="nav-item" role="presentation"><button class="nav-link{% if action_tab == "endorse" %} active{% endif %}" id="tab-route-button" data-bs-toggle="tab" data-bs-target="#tab-route" type="button" role="tab" aria-controls="tab-route" aria-selected="{% if action_tab == "endorse" %}true{% else %}false{% endif %}"{% if action_tab != "endorse" %} tabindex="-1"{% endif %}>Forward or return</button></li>{% endif %}
+            {% if can_complete %}<li class="nav-item" role="presentation"><button class="nav-link{% if action_tab == "complete" %} active{% endif %}" id="tab-complete-button" data-bs-toggle="tab" data-bs-target="#tab-complete" type="button" role="tab" aria-controls="tab-complete" aria-selected="{% if action_tab == "complete" %}true{% else %}false{% endif %}"{% if action_tab != "complete" %} tabindex="-1"{% endif %}>Complete</button></li>{% endif %}
+            {% if access.tracking.share %}<li class="nav-item" role="presentation"><button class="nav-link{% if action_tab == "share" %} active{% endif %}" id="tab-share-button" data-bs-toggle="tab" data-bs-target="#tab-share" type="button" role="tab" aria-controls="tab-share" aria-selected="{% if action_tab == "share" %}true{% else %}false{% endif %}"{% if action_tab != "share" %} tabindex="-1"{% endif %}>Share access</button></li>{% endif %}
+          </ul>
+
+          <div class="tab-content">
+            {% if access.tracking.work %}<div class="tab-pane fade{% if action_tab == "work" %} show active{% endif %}" id="tab-remark" role="tabpanel" aria-labelledby="tab-remark-button">
+              <form method="post" action="{{ record_action_urls.add_remark }}" enctype="multipart/form-data">
+                {% csrf_token %}
+                {% include "partials/_upload_draft.html" with form=remark_form %}
+                {% include "partials/_form_errors.html" with form=remark_form %}
+                {% include "partials/_field.html" with field=remark_form.remark %}
+                {% if access.tracking.edit_files %}{% include "partials/_field.html" with field=remark_form.attachments %}{% endif %}
+                <button class="btn btn-udm" type="submit">Save remark</button>
+              </form>
+            </div>{% endif %}
+
+            {% if access.tracking.endorse %}<div class="tab-pane fade{% if action_tab == "endorse" %} show active{% endif %}" id="tab-route" role="tabpanel" aria-labelledby="tab-route-button">
+              <form method="post" action="{{ record_action_urls.route }}" enctype="multipart/form-data">
+                {% csrf_token %}
+                {% include "partials/_upload_draft.html" with form=route_form %}
+                {% include "partials/_form_errors.html" with form=route_form %}
+                <div class="mb-3">
+                  <label class="form-label">Requested Action</label>
+                  {% for radio in route_form.action %}
+                    <div class="form-check">{{ radio.tag }} <label class="form-check-label" for="{{ radio.id_for_label }}">{{ radio.choice_label }}</label></div>
+                  {% endfor %}
+                </div>
+                {% include "partials/_field.html" with field=route_form.offices %}
+                {% include "partials/_field.html" with field=route_form.instructions %}
+                {% include "tracking/_deadline_field.html" with form=route_form %}
+                {% if access.tracking.edit_files %}{% include "partials/_field.html" with field=route_form.attachments %}{% endif %}
+                <button class="btn btn-udm" type="submit">Send Document</button>
+              </form>
+            </div>{% endif %}
+
+            {% if can_complete %}
+            <div class="tab-pane fade{% if action_tab == "complete" %} show active{% endif %}" id="tab-complete" role="tabpanel" aria-labelledby="tab-complete-button">
+              <form method="post" action="{{ record_action_urls.complete }}" data-completed-status="{{ "COMPLETED_PENDING_UPLOAD"|status_label }}">
+                {% csrf_token %}
+                {% include "partials/_field.html" with field=complete_form.note %}
+                {% if can_complete_and_file %}
+                {% include "partials/_field.html" with field=complete_form.archive_now %}
+                {% else %}
+                  <p class="form-text">Completion finishes the work. An authorized administrator approves filing into the repository.</p>
+                {% endif %}
+                <button class="btn btn-udm-green" type="submit">Mark as Completed</button>
+              </form>
+            </div>
+            {% endif %}
+
+            {% if access.tracking.share %}<div class="tab-pane fade{% if action_tab == "share" %} show active{% endif %}" id="tab-share" role="tabpanel" aria-labelledby="tab-share-button">
+              <form method="post" action="{{ record_action_urls.grant_access }}">
+                {% csrf_token %}
+                {% include "partials/_field.html" with field=grant_form.office %}
+                {% include "partials/_field.html" with field=grant_form.user %}
+                {% include "partials/_field.html" with field=grant_form.reason %}
+                <button class="btn btn-udm-outline" type="submit">Grant access</button>
+              </form>
+            </div>{% endif %}
+          </div>
+        </div>
+      </div>
+    {% elif record.status == "DRAFT" %}
+      <div class="help-note mt-4">This draft has not been sent. Review and send it before recording receipt or completion.</div>
+    {% elif user.is_viewer %}
+      <div class="help-note mt-4">Your account has read-only access. You can read permitted records and print their routing slips.</div>
+    {% elif not can_confirm and record.status != "COMPLETED" %}
+      <div class="help-note mt-4">
+        Your office is not holding this document right now, so the action panel is hidden.
+        You can still read the record and its history because it passed through {{ user.office.code|default:"your office" }}.
+      </div>
+    {% endif %}
+
+    {% if show_filing_panel %}
+      <div class="card-udm mt-4 no-print">
+        <div class="card-udm-head"><h2>This record is completed but not yet approved</h2></div>
+        <div class="card-udm-body">
+          <p class="text-muted body-copy">
+            The work is finished. Until an administrator approves it, the record stays in
+            the <strong>{{ "COMPLETED_PENDING_UPLOAD"|status_label }}</strong> queue on the Document Tracking
+            page — still tracked, not yet searchable as a repository document.
+          </p>
+          {% if can_archive_now %}
+            {# Navy, matching "Approve" in the pending-upload queue: one action, one look. #}
+            <form method="post" action="{{ record_action_urls.archive }}">{% csrf_token %}
+              <button class="btn btn-udm" type="submit">Approve into Document Repository</button>
+            </form>
+          {% endif %}
+          {% if can_reopen %}
+            <hr>
+            <p class="text-muted body-copy">
+              Completed by mistake? Send it back to active tracking. Nothing is erased —
+              the completion stays in the history with this reason beneath it.
+            </p>
+            <form method="post" action="{{ record_action_urls.reopen }}">
+              {% csrf_token %}
+              {% include "partials/_field.html" with field=reopen_form.reason %}
+              <button class="btn btn-udm-outline" type="submit">Return to tracking</button>
+            </form>
+          {% endif %}
+        </div>
+      </div>
+    {% endif %}
+    </div>
+
+    <div class="card-udm tracking-record-history">
+      <div class="card-udm-head">
+        <h2>Routing timeline</h2>
+        <span class="text-muted small">Append-only — nothing is ever overwritten</span>
+      </div>
+      <p class="timeline-basis">{{ office_hours_caveat }}</p>
+      <div class="card-udm-body">
+        {% comment %}
+          The history is append-only and grows for the life of the record, so a
+          document that has been round five offices opens as a wall nobody
+          reads. The oldest entries fold; the newest always stay open, because
+          "where is it now" is the question this page is opened to answer.
+
+          Rendered with `open` and closed by doctrack.js, never the other way
+          round — with the script blocked the whole history is still there, and
+          the fold reopens for printing. Hiding is the enhancement.
+        {% endcomment %}
+        {% if older_steps %}
+          <details class="fold" open>
+            <summary class="disclosure-control">
+              <span class="disclosure-copy"><span class="disclosure-title">{{ older_steps|length }} earlier movement{{ older_steps|length|pluralize }}</span><span class="disclosure-description">Review previous routing steps between offices.</span></span>
+              {% include "core/_disclosure_state.html" %}
+            </summary>
+            <ul class="timeline">
+              {% for step in older_steps %}{% include "tracking/_timeline_step.html" %}{% endfor %}
+            </ul>
+          </details>
+        {% endif %}
+        <ul class="timeline">
+          {% for step in recent_steps %}
+            {% include "tracking/_timeline_step.html" %}
+          {% empty %}
+            <li class="is-muted">
+              <div class="t-title">Draft created</div>
+              <div class="t-meta">Not routed yet. Open the review step to send it.</div>
+            </li>
+          {% endfor %}
+        </ul>
+
+        <hr>
+        <h3 class="section-heading">Activity log</h3>
+        {% if older_activities %}
+          <details class="fold" open>
+            <summary class="disclosure-control">
+              <span class="disclosure-copy"><span class="disclosure-title">{{ older_activities|length }} earlier entr{{ older_activities|length|pluralize:"y,ies" }}</span><span class="disclosure-description">Review earlier updates in the activity log.</span></span>
+              {% include "core/_disclosure_state.html" %}
+            </summary>
+            <ul class="timeline">
+              {% for activity in older_activities %}{% include "tracking/_timeline_activity.html" %}{% endfor %}
+            </ul>
+          </details>
+        {% endif %}
+        <ul class="timeline">
+          {% for activity in recent_activities %}{% include "tracking/_timeline_activity.html" %}{% endfor %}
+        </ul>
+      </div>
+    </div>
+
+  </div>
+</div>
+</div>
+{% endblock %}

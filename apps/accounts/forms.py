@@ -1,0 +1,316 @@
+from __future__ import annotations
+
+from urllib.parse import urlsplit
+
+from django import forms
+from django.conf import settings
+from django.contrib.admin.forms import AdminAuthenticationForm
+from django.contrib.auth.forms import (
+    AuthenticationForm,
+    PasswordChangeForm,
+    PasswordResetForm,
+    SetPasswordForm,
+    UserCreationForm,
+    UsernameField,
+)
+from django.core.exceptions import ValidationError
+from django.db import transaction
+from django.utils.crypto import constant_time_compare
+
+from apps.core.forms import BootstrapFormMixin, ColourInput
+from apps.core.models import NotificationPreference
+
+from .models import Office, User
+
+_USERNAME_MAX_LENGTH = User._meta.get_field(User.USERNAME_FIELD).max_length
+
+
+class SignInForm(BootstrapFormMixin, AuthenticationForm):
+    username = forms.CharField(
+        label="Username",
+        max_length=_USERNAME_MAX_LENGTH,
+        widget=forms.TextInput(attrs={
+                               "autofocus": True, "placeholder": "Enter username", "autocomplete": "username"}),
+    )
+    password = forms.CharField(
+        label="Password",
+        strip=False,
+        widget=forms.PasswordInput(
+            attrs={"placeholder": "Enter password", "autocomplete": "current-password"}),
+    )
+
+    error_messages = {
+        "invalid_login": "That username and password do not match an account. Check both and try again.",
+        "inactive": "This account is deactivated. Ask the system administrator to reactivate it.",
+    }
+
+
+class SystemAdminAuthenticationForm(AdminAuthenticationForm):
+    username = UsernameField(
+        max_length=_USERNAME_MAX_LENGTH,
+        widget=forms.TextInput(attrs={"autofocus": True}),
+    )
+
+
+class VerifiedEmailPasswordResetForm(BootstrapFormMixin, PasswordResetForm):
+    def get_users(self, email):
+        return (user for user in super().get_users(email) if user.email_is_verified)
+
+    def save(self, **kwargs):
+        if settings.SITE_BASE_URL:
+            kwargs["domain_override"] = urlsplit(settings.SITE_BASE_URL).netloc
+            kwargs["use_https"] = True
+        return super().save(**kwargs)
+
+
+class CurrentAccountPasswordSaveMixin:
+    """A password form may not overwrite newer account details or credentials."""
+
+    def save(self, commit=True):
+        if not commit:
+            return super().save(commit=False)
+        previous_hash = self.user.password
+        with transaction.atomic():
+            current = User.objects.select_for_update().filter(pk=self.user.pk).first()
+            if current is None or not constant_time_compare(current.password, previous_hash):
+                raise ValidationError(
+                    "Your password was updated while this form was open. Sign in again or request a new recovery link."
+                )
+            if not current.is_active:
+                raise ValidationError("This account is suspended. Contact the system administrator.")
+            self.user = current
+            user = super().save(commit=False)
+            # Django's default saves the entire user instance, including stale
+            # roles, office assignments, suspensions, and email verification.
+            user.save(update_fields=["password"])
+            return user
+
+
+class AccountPasswordChangeForm(CurrentAccountPasswordSaveMixin, BootstrapFormMixin, PasswordChangeForm):
+    """Keep Django's validation and require a different forced-change password."""
+
+    def clean(self):
+        cleaned = super().clean()
+        password = cleaned.get("new_password1")
+        if self.user.must_change_password and password and self.user.check_password(password):
+            self.add_error("new_password1", "Choose a password different from the one the administrator gave you.")
+        return cleaned
+
+
+class AccountSetPasswordForm(CurrentAccountPasswordSaveMixin, BootstrapFormMixin, SetPasswordForm):
+    """Password recovery uses the same widgets as the signed-in account forms."""
+
+
+def _offices_for(actor):
+    """The offices this administrator may place an account in.
+
+    An office administrator restricted to their own office in the *queryset*
+    cannot post another office's id either: a ModelChoiceField validates the
+    submitted value against its queryset, so the restriction is a real one and
+    not just a shorter dropdown.
+    """
+    if actor is None or actor.is_system_admin:
+        return Office.active.all()
+    return Office.active.filter(pk=actor.office_id)
+
+
+def _roles_for(actor):
+    if actor is None:
+        return list(User.Role.choices)
+    return actor.assignable_roles()
+
+
+def _validated_role(role, actor):
+    """Refuse a role the actor may not hand out.
+
+    The choice list is already narrowed, but a ChoiceField's own validation is
+    built from the choices present when the form was constructed, and this form
+    is constructed per request from a mutable attribute. Re-checking against the
+    actor is the version that cannot be out-manoeuvred by a crafted POST — and
+    the thing being guarded is an office administrator minting a system
+    administrator, which is the whole role split undone in one request.
+    """
+    if actor is None or actor.is_system_admin:
+        return role
+    if role == User.Role.SYSTEM_ADMIN:
+        raise forms.ValidationError(
+            "Only a system administrator can grant the system administrator role."
+        )
+    return role
+
+
+def _validated_office(office, actor):
+    if actor is None or actor.is_system_admin:
+        return office
+    if office is None or not actor.office_id or office.pk != actor.office_id:
+        raise forms.ValidationError("You can only manage accounts in your own office.")
+    return office
+
+
+class AdminUserCreateForm(BootstrapFormMixin, UserCreationForm):
+    """Accounts are created here — there is no public registration page."""
+
+    first_name = forms.CharField(max_length=60)
+    last_name = forms.CharField(max_length=60)
+    email = forms.EmailField(required=False)
+
+    class Meta:
+        model = User
+        fields = ("username", "first_name", "last_name",
+                  "email", "office", "role", "position", "phone")
+
+    def __init__(self, *args, actor=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.actor = actor
+        self.fields["office"].queryset = _offices_for(actor)
+        self.fields['email'].required = getattr(settings, 'EMAIL_OTP_REQUIRED', True)
+        self.fields["office"].required = True
+        if actor is not None and not actor.is_system_admin and actor.office_id:
+            self.fields["office"].initial = actor.office_id
+        self.fields["role"].choices = _roles_for(actor)
+        self.fields["must_change_password"] = forms.BooleanField(
+            required=False, initial=True, label="Ask the user to change this password at first sign-in"
+        )
+        self.fields["must_change_password"].widget.attrs["class"] = "form-check-input"
+
+    def clean_role(self):
+        return _validated_role(self.cleaned_data.get("role"), self.actor)
+
+    def clean_office(self):
+        return _validated_office(self.cleaned_data.get("office"), self.actor)
+
+    def save(self, commit=True):
+        user = super().save(commit=False)
+        user.must_change_password = self.cleaned_data.get(
+            "must_change_password", True)
+        if commit:
+            user.save()
+        return user
+
+
+class AdminUserUpdateForm(BootstrapFormMixin, forms.ModelForm):
+    class Meta:
+        model = User
+        fields = (
+            "first_name", "last_name", "email", "office", "role", "position", "phone", "is_active",
+        )
+
+    def __init__(self, *args, editing_self: bool = False, actor=None, **kwargs):
+        super().__init__(*args, **kwargs)
+        self.editing_self = editing_self
+        self.actor = actor
+        self.fields["office"].queryset = _offices_for(actor)
+        self.fields["role"].choices = _roles_for(actor)
+        self.fields["is_active"].label = "Account is active"
+        if getattr(settings, 'EMAIL_OTP_REQUIRED', True):
+            self.fields['email'].widget.attrs['readonly'] = True
+            self.fields['email'].help_text = 'Use Email security to replace an address and require verification.'
+
+    def clean_email(self):
+        value = self.cleaned_data.get('email', '')
+        if getattr(settings, 'EMAIL_OTP_REQUIRED', True) and value.casefold() != self.instance.email.casefold():
+            raise forms.ValidationError('Use Email security for an audited email replacement.')
+        return value
+
+    def clean_role(self):
+        return _validated_role(self.cleaned_data.get("role"), self.actor)
+
+    def clean_office(self):
+        return _validated_office(self.cleaned_data.get("office"), self.actor)
+
+    def clean(self):
+        """Stop an administrator locking everyone out of administration.
+
+        The suspend/reactivate button already refuses to act on your own
+        account, but this form could do both of the same things — drop your own
+        role to USER, or clear "Account is active" — and there is no screen left
+        that could undo either afterwards. Only the shell could, which for this
+        project means nobody could.
+        """
+        cleaned = super().clean()
+        from .admin_safety import is_ready_system_admin, ready_system_admins
+
+        role = cleaned.get('role')
+        loses_ready_access = is_ready_system_admin(self.instance) and (
+            role != User.Role.SYSTEM_ADMIN or not cleaned.get('is_active'))
+        if loses_ready_access and not ready_system_admins(exclude_ids=[self.instance.pk]):
+            field = 'role' if cleaned.get('role') != User.Role.SYSTEM_ADMIN else 'is_active'
+            self.add_error(field, 'Keep another ready system administrator before removing this account\'s access.')
+        if not self.editing_self:
+            return cleaned
+        if role not in {User.Role.ADMIN, User.Role.SYSTEM_ADMIN}:
+            self.add_error(
+                "role",
+                "You cannot remove your own administrator role. Ask another "
+                "administrator to change it for you.",
+            )
+        elif (
+            role == User.Role.ADMIN
+            and self.instance.role == User.Role.SYSTEM_ADMIN
+            and not ready_system_admins(exclude_ids=[self.instance.pk])
+        ):
+            # Stepping down to office administrator is a demotion like any
+            # other, except when you are the last account that can undo it.
+            self.add_error(
+                "role",
+                "You are the only system administrator. Promote somebody else "
+                "before stepping down, or there will be nobody who can.",
+            )
+        if not cleaned.get("is_active"):
+            self.add_error("is_active", "You cannot deactivate your own account.")
+        return cleaned
+
+
+class AdminSetPasswordForm(BootstrapFormMixin, SetPasswordForm):
+    """Administrator sets a new password for someone who is locked out."""
+
+
+class OfficeForm(BootstrapFormMixin, forms.ModelForm):
+    class Meta:
+        model = Office
+        fields = (
+            "code", "name", "short_name", "cluster", "parent", "head_name", "email", "location",
+            "colour", "sort_order", "is_active",
+        )
+        widgets = {"colour": ColourInput()}
+        help_texts = {
+            "code": "Appears inside every tracking number, so keep it short and stable."}
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # A colour input has no empty state — left blank it posts #000000, which
+        # would read as a deliberate choice of black. Showing the colour the
+        # office would be given anyway means whatever is saved is what was seen.
+        if not self.initial.get("colour") and not getattr(self.instance, "colour", ""):
+            self.initial["colour"] = Office.next_free_colour()
+        self.fields["colour"].widget.attrs["class"] = "form-control form-control-colour"
+
+    def clean_code(self):
+        return self.cleaned_data["code"].strip().upper()
+
+
+class ProfileForm(BootstrapFormMixin, forms.ModelForm):
+    class Meta:
+        model = User
+        fields = ("first_name", "last_name", "email", "phone", "position")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        if getattr(settings, 'EMAIL_OTP_REQUIRED', True):
+            self.fields['email'].widget.attrs['readonly'] = True
+            self.fields['email'].help_text = 'Use Change email to verify a replacement address securely.'
+
+    def clean_email(self):
+        value = self.cleaned_data.get('email', '')
+        if getattr(settings, 'EMAIL_OTP_REQUIRED', True) and value.casefold() != self.instance.email.casefold():
+            raise forms.ValidationError('Use Change email and verify the replacement before it becomes active.')
+        return value
+
+
+class NotificationPreferenceForm(BootstrapFormMixin, forms.ModelForm):
+    class Meta:
+        model = NotificationPreference
+        fields = ("in_app_enabled",)
+        labels = {
+            "in_app_enabled": "Show in-app notifications",
+        }

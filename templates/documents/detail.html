@@ -1,0 +1,158 @@
+{% extends "base.html" %}
+{% load doctrack %}
+{% block title %}{{ document.title }} · {{ SITE_NAME }}{% endblock %}
+{% block content %}
+{% if document.is_external %}{% external_office_query as external_query %}{% endif %}
+<div class="workspace-page workspace-detail workspace-document-detail">
+<div class="page-head">
+  <div>
+    <div class="eyebrow">{% if document.is_external %}External {% endif %}Document Repository</div>
+    <a href="{{ document.repository_url }}{{ external_query }}">Back to {% if document.is_external %}external {% endif %}repository</a>
+    <h1>{{ document.title }}</h1>
+    <p class="sub">
+      {{ document.office.name }} · {{ document.document_type_names|default:"Unclassified" }}
+      · {{ document.document_date|default:document.created_at|date:"d M Y" }}
+      {% if document.reference_number %}· <span class="mono">{{ document.reference_number }}</span>{% endif %}
+    </p>
+  </div>
+  <div class="page-actions">
+    {% if file_access.view_content %}<a class="btn btn-udm-outline" href="{% url 'documents:source_units' document.pk %}{{ external_query }}">Source text and topic review</a>{% endif %}
+    {% if can_edit %}<a class="btn btn-udm-outline" href="{% url 'documents:edit' document.pk %}{{ external_query }}">Edit Metadata</a>{% endif %}
+    {% if can_review_deletion %}<a class="btn btn-udm-outline" href="{% url 'documents:deletion_review' document.pk %}{{ external_query }}">Deletion review</a>{% endif %}
+    {% if document.primary_file and file_access.download %}
+      <a class="btn btn-udm" href="{% signed_download_url 'documents:file_download' document.primary_file.pk %}">Download</a>
+    {% endif %}
+  </div>
+</div>
+
+<div class="card-udm mb-4">
+  <div class="card-udm-body d-flex flex-wrap gap-4 align-items-center">
+    <div><span class="text-muted small d-block">Repository source</span><strong>{% if document.source == "DTS" %}Completed tracking record{% else %}Historical office upload{% endif %}</strong></div>
+    <div><span class="text-muted small d-block">Owning office</span>{% include "partials/_office_badge.html" with office=document.office %}</div>
+    <div><span class="text-muted small d-block">Access</span><strong>{{ document.get_access_level_display }}</strong></div>
+    {% if document.tracking_origin %}<div class="ms-lg-auto"><a href="{{ document.tracking_origin.get_absolute_url }}{{ external_query }}">Open tracking history</a></div>{% endif %}
+    {% if document.is_external %}<div><span class="text-muted small d-block">External counterparts at filing</span>{% for link in document.external_office_links.all %}<span class="badge text-bg-secondary">{{ link.name_snapshot }}</span> {% empty %}None recorded{% endfor %}</div>{% endif %}
+  </div>
+</div>
+
+<div class="row g-4 workspace-columns">
+  <div class="col-lg-8 workspace-primary">
+    <div class="card-udm workspace-panel">
+      <div class="card-udm-head"><h2>Document Metadata</h2>
+        <span class="pill pill-muted">{{ document.get_access_level_display }}</span>
+      </div>
+      <div class="card-udm-body">
+        <div class="row">
+          <div class="col-md-6"><table class="table table-sm table-stacked">
+            <tr><th class="text-muted fw-normal">Owning office</th><td>{{ document.office.name }}</td></tr>
+            <tr><th class="text-muted fw-normal">Document types</th><td>{% include "partials/_document_types_display.html" with item=document empty_label="—" %}</td></tr>
+            <tr><th class="text-muted fw-normal">Document date</th><td>{{ document.document_date|date:"d M Y"|default:"—" }}</td></tr>
+            <tr><th class="text-muted fw-normal">Year</th><td>{{ document.year }}</td></tr>
+            <tr><th class="text-muted fw-normal">Deletion review date</th><td>{% if document.retention_until %}{{ document.retention_until|date:"d M Y" }}{% if document.retention_is_due %}<br><strong class="text-danger">Review due; administrator approval is required before removal.</strong>{% elif document.retention_is_due_soon %}<br><span class="text-muted">Review due within the next 90 days.</span>{% endif %}{% else %}No deletion review date set{% endif %}</td></tr>
+          </table></div>
+          <div class="col-md-6"><table class="table table-sm table-stacked">
+            <tr><th class="text-muted fw-normal">From / author</th><td>{{ document.author_name|default:"—" }}</td></tr>
+            <tr><th class="text-muted fw-normal">To / recipient</th><td>{{ document.recipient_name|default:"—" }}</td></tr>
+            <tr><th class="text-muted fw-normal">Signatory</th><td>{{ document.signatory|default:"—" }}</td></tr>
+            <tr><th class="text-muted fw-normal">Filed by</th><td>{{ document.uploaded_by.display_name|default:"—" }}</td></tr>
+          </table></div>
+        </div>
+
+        {% if metadata_values %}
+          <h3 class="section-heading mt-3">Office fields</h3>
+          <table class="table table-sm table-stacked">
+            {% for value in metadata_values %}
+              <tr><th class="text-muted fw-normal" style="min-width:160px;max-width:220px;">{{ value.field.label }}</th><td>{{ value.value }}</td></tr>
+            {% endfor %}
+          </table>
+        {% endif %}
+
+        <h3 class="section-heading">Tags</h3>
+        <div>
+          {% for tag in document.tags.all %}
+            <a class="tag-chip" href="{% if document.is_external %}{{ document.repository_url }}{% else %}{% url 'search:index' %}{% endif %}?q={{ tag.name|urlencode }}{% if external_query %}&amp;{{ external_query|cut:"?" }}{% endif %}">{{ tag.name }}</a>
+          {% empty %}
+            <span class="text-muted">No tags are assigned. Add tags to improve search and organization.</span>
+          {% endfor %}
+        </div>
+
+        {% if document.description %}
+          <h3 class="section-heading mt-3">Abstract</h3>
+          <p class="body-copy">{{ document.description|linebreaksbr }}</p>
+        {% endif %}
+      </div>
+    </div>
+
+
+  </div>
+
+  <div class="col-lg-4 workspace-support">
+    <div class="card-udm workspace-panel">
+      <div class="card-udm-head"><h2>Files</h2></div>
+      <div class="card-udm-body">
+        <p class="small text-muted">Filed contents and version history are read-only. Authorized metadata corrections remain available.</p>
+        {% include "partials/_file_versions.html" %}
+      </div>
+    </div>
+
+    {% if document.tracking_origin %}
+      <div class="card-udm mt-4">
+        <div class="card-udm-head"><h2>Origin</h2></div>
+        <div class="card-udm-body">
+          <p class="body-copy">Archived from tracking record</p>
+          <a class="mono" href="{{ document.tracking_origin.get_absolute_url }}{{ external_query }}">{{ document.tracking_origin.display_tracking_number }}</a>
+          {% if document.is_external and document.tracking_origin.original_reference %}<p>Original paper reference: <span class="mono">{{ document.tracking_origin.original_reference }}</span></p>{% endif %}
+          <div class="text-muted supporting-copy">
+            Completed {{ document.tracking_origin.completed_at|date:"d M Y, g:i A" }}
+          </div>
+        </div>
+      </div>
+    {% endif %}
+
+    {% if suggestion %}
+      <div class="card-udm mt-4">
+        <div class="card-udm-head"><h2>Suggestion audit</h2></div>
+        <div class="card-udm-body supporting-copy">
+          <div>Engine: <strong>{{ suggestion.engine }} v{{ suggestion.engine_version }}</strong></div>
+          <div>Reviewed by: {{ suggestion.reviewed_by.display_name|default:"not reviewed yet" }}</div>
+          <div>Edited by the user: {{ suggestion.was_edited|yesno:"yes,no" }}</div>
+          <p class="form-text mb-0 mt-2">Kept as a labelled example for training the metadata model later.</p>
+        </div>
+      </div>
+    {% endif %}
+
+    {% if related %}
+      <div class="card-udm mt-4">
+        <div class="card-udm-head"><h2>Same office</h2></div>
+        <div class="card-udm-body">
+          {% for item in related %}
+            <div class="py-1"><a href="{{ item.get_absolute_url }}{{ external_query }}">{{ item.title|truncatechars:44 }}</a></div>
+          {% endfor %}
+        </div>
+      </div>
+    {% endif %}
+  </div>
+</div>
+    {% include "documents/_deletion_review_history.html" %}
+    {% if file_access.view_content %}<div class="card-udm workspace-panel workspace-extracted-text mt-4">
+      <div class="card-udm-head">
+        <h2>Extracted Text</h2>
+        <span class="text-muted small">{{ document.ocr_engine|default:"none" }} · {{ document.get_ocr_status_display }}{% if document.ocr_confidence != None %} · {{ document.ocr_confidence|floatformat:2 }} confidence{% endif %}</span>
+      </div>
+      <div class="card-udm-body">
+        {% if document.has_text %}
+          <div class="text-preview">{{ document.ocr_text|truncatechars:6000 }}</div>
+        {% else %}
+          <p class="text-muted mb-2">No text was extracted. This record remains searchable by metadata and tags.</p>
+        {% endif %}
+        <p class="small text-muted mt-2 mb-1">Language hint: {{ document.get_ocr_language_display }}. External OCR: {% if document.allow_external_ocr %}allowed when needed{% else %}disabled for this record{% endif %}.</p>
+        {% if document.ocr_notes %}<div class="help-note mt-2" role="status">{{ document.ocr_notes|linebreaksbr }}</div>{% endif %}
+        {% if can_extract %}
+          <form method="post" action="{% url 'documents:re_extract' document.pk %}{{ external_query }}" class="mt-2">{% csrf_token %}
+            <button class="btn btn-udm-outline btn-sm" type="submit">Run text extraction again</button>
+          </form>
+        {% endif %}
+      </div>
+    </div>{% endif %}
+</div>
+{% endblock %}

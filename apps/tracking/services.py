@@ -1,0 +1,1848 @@
+"""Business rules for document tracking.
+
+Views never edit tracking models directly — they call these functions, so the
+rules (append-only history, explicit receipt, audit logging) hold everywhere.
+"""
+
+from __future__ import annotations
+
+import logging
+from datetime import timedelta
+from uuid import uuid4
+
+from django.conf import settings
+from django.core.exceptions import PermissionDenied, ValidationError
+from django.db import transaction
+from django.db.models import (
+    Case,
+    CharField,
+    Count,
+    Exists,
+    F,
+    Max,
+    OuterRef,
+    Q,
+    Value,
+    When,
+)
+from django.utils import timezone
+
+from apps.accounts.capabilities import requires_capability
+from apps.core.models import AuditLog, Notification
+from apps.core.notifications import notify_office, notify_offices, overdue_notice_text, resolve_for_record
+from apps.core.pagination import DEFAULT_PAGE_SIZE
+from apps.core.permissions import active_writer, locked_mutation
+from apps.core.storage import compensate_storage, create_stored_file
+from apps.core.utils import checksum_of, log_action, truncate, validate_upload
+
+from .models import (
+    ACTIVE_STATUSES,
+    COMPLETED_STATUSES,
+    MAX_INSTRUCTIONS_CHARS,
+    MAX_NOTE_CHARS,
+    MAX_REMARK_CHARS,
+    Attachment,
+    RecordAccessGrant,
+    RecordActivity,
+    RoutingSLA,
+    RoutingStep,
+    Status,
+    TrackingNumberSequence,
+    TrackingRecord,
+    overdue_q,
+)
+
+logger = logging.getLogger("doctrack")
+
+#: Distinguishes "caller said nothing about a deadline" (fall back to due_days)
+#: from "caller explicitly said there is no deadline" (due_at=None). A plain
+#: None default would silently turn the latter into the former.
+_UNSET = object()
+
+
+def refuse_viewers(user, action: str) -> None:
+    """Stop a read-only account writing anything.
+
+    Enforced here rather than only in the views, because hiding a button is not
+    a permission: the endpoints stay reachable by anyone who knows the URL, and
+    a service function is what every path — view, management command, background
+    task — actually goes through.
+    """
+    if not getattr(user, "is_authenticated", False) or not getattr(user, "can_start_work", False):
+        raise PermissionDenied(
+            f"Your account has view-only access and cannot {action}. "
+            "Ask your office administrator if you need to make changes."
+        )
+
+
+def ensure_received(record, *, stage_label=Status.IN_PROCESS.label) -> None:
+    """Refuse a transition that presumes the document is in somebody's hands.
+
+    A document nobody has confirmed receiving is not being worked on, whatever
+    a dropdown says. Without this the status could be driven ahead of the
+    custody chain, so the timeline claimed an office was processing a document
+    that was, on the record's own evidence, still in transit to it.
+    """
+    if not record.current_step_queryset.filter(received_at__isnull=False).exists():
+        raise ValidationError(
+            "This document has not been received yet. Confirm receipt before "
+            f"marking it {stage_label}."
+        )
+
+
+# ---------------------------------------------------------------------------
+# Tracking numbers
+# ---------------------------------------------------------------------------
+#: Prefix of the placeholder a draft carries until it is sent.
+#:
+#: The column is unique and non-null, and the file storage path is built from
+#: it, so a draft cannot simply have no value — but it must not have a *real*
+#: one either. See `provisional_tracking_number`.
+DRAFT_NUMBER_PREFIX = "DRAFT"
+
+
+def provisional_tracking_number() -> str:
+    """A placeholder for a draft that has not been sent.
+
+    Drafts used to take a real number the moment they were created, which spent
+    it: a clerk who started five slips and abandoned four left four gaps in the
+    office's sequence. In a records series a gap is not neutral — it reads as
+    four documents that existed and cannot be found, which is exactly the
+    suspicion this system is meant to remove.
+
+    The number is now issued by `route_record` when the draft is actually sent,
+    so the series has no holes and the number's date is the date it entered
+    circulation. Until then the record carries one of these, which is never
+    displayed (see `TrackingRecord.display_tracking_number`).
+    """
+    return f"{DRAFT_NUMBER_PREFIX}-{uuid4().hex[:12].upper()}"
+
+
+@transaction.atomic
+def generate_tracking_number(office, when=None) -> str:
+    """UDM-OVPA-<OFFICE>-<YEAR>-<MONTH>-<SEQ>, unique even with simultaneous users."""
+    when = when or timezone.localtime()
+    sequence, _ = TrackingNumberSequence.objects.select_for_update().get_or_create(
+        office=office, year=when.year, month=when.month
+    )
+    sequence.last_number += 1
+    sequence.save(update_fields=["last_number"])
+    width = settings.TRACKING_NUMBER_SEQUENCE_WIDTH
+    return (
+        f"{settings.TRACKING_NUMBER_PREFIX}-{office.code}-{when.year}-"
+        f"{when.month:02d}-{sequence.last_number:0{width}d}"
+    )
+
+
+# ---------------------------------------------------------------------------
+# Timeline helper
+# ---------------------------------------------------------------------------
+def add_activity(record, event, message, *, actor=None, detail="", batch=None) -> RecordActivity:
+    work_office = None
+    if event in {RecordActivity.Event.REMARK, RecordActivity.Event.ATTACHMENT}:
+        actor_office = getattr(actor, "office", None)
+        if actor_office and record.has_custody(actor_office):
+            work_office = actor_office
+        elif getattr(actor, "is_system_admin", False) and record.has_custody(record.current_office):
+            work_office = record.current_office
+    return RecordActivity.objects.create(
+        record=record,
+        event=event,
+        batch=record.current_batch if batch is None else batch,
+        actor=actor,
+        actor_office=getattr(actor, "office", None),
+        work_office=work_office,
+        message=message[:255],
+        detail=detail or "",
+    )
+
+
+def log_view(record, *, user) -> RecordActivity | None:
+    """Record that somebody opened this document.
+
+    Reading is an act on a confidential record, and for a view-only account it
+    is the *only* act — without this, the people whose access is limited to
+    looking are the people the history says nothing about.
+
+    Collapsed to one entry per person per VIEW_LOG_DEDUP_MINUTES, because the
+    alternative is a row per page load: a clerk refreshing while they work would
+    bury the movement history under their own footprints, and the timeline is
+    rendered on the page being opened, so each read would lengthen the thing
+    being read.
+
+    So these rows count *reading sessions*, not page loads, and they undercount
+    on purpose. Do not present a count of them as a number of views.
+    """
+    if not getattr(user, "is_authenticated", False):
+        return None
+    already = record.activities.filter(
+        event=RecordActivity.Event.VIEWED,
+        actor=user,
+        created_at__gte=timezone.now() - timedelta(minutes=settings.VIEW_LOG_DEDUP_MINUTES),
+    ).exists()
+    if already:
+        return None
+    return add_activity(
+        record, RecordActivity.Event.VIEWED, f"{user.display_name} opened the document", actor=user
+    )
+
+
+def log_print(record, *, user) -> RecordActivity:
+    """Record that a paper copy of the routing slip was produced.
+
+    Never deduplicated, unlike `log_view`. Each print is a deliberate act that
+    puts another copy of a confidential document outside the system, and
+    repeated printing of the same record is precisely the pattern the trail
+    exists to make visible — collapsing it would erase the signal on the
+    grounds that there was too much of it.
+    """
+    return add_activity(
+        record,
+        RecordActivity.Event.PRINTED,
+        f"{user.display_name} printed the routing slip",
+        actor=user,
+    )
+
+
+# ---------------------------------------------------------------------------
+# Create / attach
+# ---------------------------------------------------------------------------
+def _one_of(value, choices, field_name: str, default: str) -> str:
+    """Reject a code that is not on the model's own choice list.
+
+    `Model.objects.create()` does not check choices, so an unrecognised value is
+    stored happily and only shows itself later as a raw code where a label
+    should be — `get_priority_display()` echoing "HIGH" back at the reader
+    because HIGH was never a priority this system has. Catching it here means
+    the caller that got it wrong is the thing that fails, not the screen.
+    """
+    if not value:
+        return default
+    valid = {code for code, _label in choices}
+    if value not in valid:
+        raise ValidationError(
+            f"“{value}” is not a valid {field_name}. Choose one of: {', '.join(sorted(valid))}."
+        )
+    return value
+
+
+@transaction.atomic
+@requires_capability('tracking', 'create')
+def create_draft_record(*, user, subject, instructions, document_type=None, document_types=None, remarks="",
+                        classification=None, priority=None, due_at=None, originating_office=None,
+                        requested_action=""):
+    refuse_viewers(user, "create documents")
+    user = active_writer(user)
+    office = originating_office or user.office
+    if not user.is_system_admin and office != user.office:
+        raise PermissionDenied("You can only originate documents for your own office.")
+    if office is None:
+        raise ValidationError("Your account has no office, so it cannot originate a document.")
+
+    from apps.core.document_types import resolve_document_types
+    selected, document_type = resolve_document_types(
+        document_types if document_types is not None else ([document_type] if document_type else []),
+        document_type,
+    )
+
+    record = TrackingRecord.objects.create(
+        # Not a real number yet — `route_record` issues that on send.
+        tracking_number=provisional_tracking_number(),
+        subject=subject.strip(),
+        document_type=document_type,
+        classification=_one_of(
+            classification,
+            TrackingRecord.Classification.choices,
+            "classification",
+            TrackingRecord.Classification.INTERNAL,
+        ),
+        priority=_one_of(
+            priority, TrackingRecord.Priority.choices, "priority", TrackingRecord.Priority.NORMAL
+        ),
+        requested_action=requested_action or "",
+        originating_office=office,
+        created_by=user,
+        instructions=instructions.strip(),
+        remarks=(remarks or "").strip(),
+        status=Status.DRAFT,
+        current_office=office,
+        current_holder=user,
+        current_batch=0,
+        due_at=due_at,
+    )
+    record.document_types.set(selected)
+    add_activity(record, RecordActivity.Event.CREATED, f"Record created by {user.display_name}", actor=user)
+    # Named by its subject: a draft has no number yet, and the placeholder it
+    # carries until it is sent is not one — written into the append-only audit
+    # log it would be quoted as a reference that never existed.
+    log_action(
+        AuditLog.Action.CREATE,
+        f"Created draft “{truncate(record.subject, 80)}”",
+        actor=user,
+        target=record,
+    )
+    return record
+
+
+@compensate_storage
+@locked_mutation
+@requires_capability('tracking', 'edit_files')
+def attach_files(record, files, *, user, note="", routing_step=None) -> list[Attachment]:
+    if files:
+        refuse_viewers(user, "upload files")
+        if not record.can_user_act(user):
+            raise PermissionDenied("Only the office holding the document can add files.")
+        if routing_step is not None and (routing_step.record_id != record.pk or routing_step.batch != record.current_batch):
+            raise ValidationError("The attachment must belong to this record's current routing batch.")
+        if len(files) > settings.MAX_UPLOAD_FILES:
+            raise ValidationError(f"Upload at most {settings.MAX_UPLOAD_FILES} files at a time.")
+    created: list[Attachment] = []
+    for uploaded in files:
+        validate_upload(uploaded)
+        attachment = create_stored_file(Attachment,
+            record=record,
+            routing_step=routing_step,
+            file=uploaded,
+            original_name=uploaded.name[:255],
+            content_type=getattr(uploaded, "content_type", "") or "",
+            size=uploaded.size or 0,
+            checksum=checksum_of(uploaded),
+            note=note[:255],
+            uploaded_by=user,
+        )
+        created.append(attachment)
+        add_activity(
+            record,
+            RecordActivity.Event.ATTACHMENT,
+            f"{user.display_name} attached {attachment.original_name}",
+            actor=user,
+        )
+    if created:
+        record.recalculate_status()
+        record.touch_movement()
+    return created
+
+
+# ---------------------------------------------------------------------------
+# Routing
+# ---------------------------------------------------------------------------
+def sending_office(record, user):
+    """Which office a forward or a return is actually leaving.
+
+    Not simply `user.office`. Ordinary staff can only act on a document their
+    own office has confirmed receipt of (see `TrackingRecord.can_user_act`), so
+    for them the two are always the same answer. A system administrator can act
+    for *any* office, and taking their own office there wrote a step claiming
+    the document left Records when it was in fact sitting in Supply — a false
+    entry in the one history this system exists to keep honest, and it moved
+    `current_office` to the administrator's office as a side effect.
+
+    An administrator with no office at all was worse still: `from_office` came
+    out None, which erased the record's location entirely (the Outgoing queue
+    joins on it) and slipped past the guard that stops a document being sent to
+    the office already holding it.
+    """
+    if user.office_id and record.has_custody(user.office):
+        return user.office
+    return record.current_office or user.office
+
+
+@locked_mutation
+@requires_capability('tracking', 'endorse')
+def route_record(record, offices, *, user, instructions="", action=RoutingStep.Action.SEND,
+                 due_days=None, due_at=_UNSET, remark="") -> list[RoutingStep]:
+    """Send the record to one or more offices. Creates a new batch of steps.
+
+    The deadline can arrive either way: `due_at` is an exact datetime picked
+    from a calendar (pass None for "no deadline"), `due_days` is the older
+    relative form. `due_at` wins when both are given.
+    """
+    refuse_viewers(user, "route documents")
+    if record.status in COMPLETED_STATUSES and record.can_user_view(user):
+        raise ValidationError("This record is completed. Reopen it before routing again.")
+    if not record.can_user_act(user):
+        raise PermissionDenied("Only the office holding the document can route it.")
+    if action not in RoutingStep.Action.values:
+        raise ValidationError("Choose a valid routing action.")
+    offices = list({office.pk: office for office in offices if office is not None}.values())
+    if not offices:
+        raise ValidationError("Select at least one receiving office.")
+    from apps.accounts.models import Office
+
+    # A form's selected instances can outlive an office's deactivation. Reload
+    # and keep each destination active until this transfer commits. Lock in PK
+    # order while retaining the caller's recipient order for parallel routes.
+    destinations = {
+        office.pk: office
+        for office in Office.objects.select_for_update(no_key=True).filter(
+            pk__in=[office.pk for office in offices], is_active=True,
+        ).order_by("pk")
+    }
+    if len(destinations) != len(offices):
+        raise ValidationError("Choose an active receiving office.")
+    offices = [destinations[office.pk] for office in offices]
+
+    if action == RoutingStep.Action.SEND:
+        if record.status != Status.DRAFT:
+            raise ValidationError("Only a draft can be sent for the first time.")
+        from_office = record.originating_office
+    else:
+        from_office = sending_office(record, user)
+
+    if from_office is None:
+        raise ValidationError(
+            "This record has no office to send it from. Assign the acting user to an office, "
+            "or have the office currently holding the document route it."
+        )
+
+    # Guard against a step whose from_office and to_office are the same office.
+    # This used to fire only when the sender was the *sole* recipient, so
+    # picking "own office + another office" slipped through and wrote a
+    # self-addressed step: the office then sat in its own inbox waiting to
+    # receive a document it had never let go of. It also used to be skipped
+    # entirely whenever from_office came out None, which is precisely when the
+    # sender was unknown and the guard was needed most.
+    if any(office.pk == from_office.pk for office in offices):
+        raise ValidationError("A document cannot be routed to the office that is sending it.")
+
+    batch = (record.routing_steps.aggregate(value=Max("batch"))["value"] or 0) + 1
+    sequence = record.routing_steps.aggregate(value=Max("sequence"))["value"] or 0
+
+    if due_at is _UNSET:
+        # Recomputed on every hop — SEND, FORWARD and RETURN alike — so each
+        # office is measured against its own rule rather than inheriting the
+        # clock of whoever held the document before it.
+        #
+        # `due_at` passed explicitly still wins, including an explicit None:
+        # that is how "No deadline" reaches here from the forms, and a
+        # deliberate "no deadline" is not something an SLA may overrule.
+        if due_days is None:
+            due_days = sla_due_days_for(offices, record.document_type)
+        due_at = timezone.now() + timedelta(days=int(due_days)) if due_days else None
+
+    steps: list[RoutingStep] = []
+    for office in offices:
+        sequence += 1
+        steps.append(
+            RoutingStep.objects.create(
+                record=record,
+                sequence=sequence,
+                batch=batch,
+                action=action,
+                from_office=from_office,
+                to_office=office,
+                sent_by=user,
+                instructions=(instructions or record.instructions)[:MAX_INSTRUCTIONS_CHARS],
+                due_at=due_at,
+            )
+        )
+
+    record.current_batch = batch
+    record.due_at = due_at
+    record.last_movement_at = timezone.now()
+    saved_fields = ["current_batch", "due_at", "last_movement_at", "status", "updated_at"]
+    if record.status == Status.DRAFT:
+        # The number is issued here, on the first send, rather than when the
+        # draft was created — so an abandoned draft leaves no gap in the
+        # office's series and the number's month is the month it went out.
+        record.tracking_number = generate_tracking_number(record.originating_office)
+        saved_fields.append("tracking_number")
+        # recalculate_status() deliberately does nothing for DRAFT/COMPLETED
+        # records (see its docstring) so that calling it elsewhere can never
+        # accidentally pull a draft out of editing. That guard would also
+        # skip the very first routing of a record — which is exactly the
+        # transition out of DRAFT we need it to compute — so it is cleared
+        # here first. The value is a placeholder; recalculate_status()
+        # immediately below computes the real one from the routing steps.
+        record.status = Status.PENDING_RECEIPT
+    record.save(update_fields=saved_fields)
+    # recalculate_status() is the single source of truth for status,
+    # current_office and current_holder — computing them again here
+    # previously duplicated that logic and had drifted out of sync with it.
+    record.recalculate_status()
+
+    office_labels = ", ".join(office.code for office in offices)
+    verb = {"SEND": "Routed", "FORWARD": "Forwarded", "RETURN": "Returned"}[action]
+    add_activity(
+        record,
+        {
+            RoutingStep.Action.SEND: RecordActivity.Event.SENT,
+            RoutingStep.Action.FORWARD: RecordActivity.Event.FORWARDED,
+            RoutingStep.Action.RETURN: RecordActivity.Event.RETURNED,
+        }[action],
+        f"{verb} to {office_labels} by {user.display_name}",
+        actor=user,
+        detail=remark or instructions,
+        batch=batch,
+    )
+    log_action(
+        AuditLog.Action.ROUTE,
+        f"{verb} {record.tracking_number} to {office_labels}",
+        actor=user,
+        target=record,
+        extra={"offices": office_labels, "action": action},
+    )
+    resolve_for_record(record, kinds=[
+        Notification.Kind.ROUTED, Notification.Kind.UNRECEIVED, Notification.Kind.OVERDUE,
+    ])
+    notify_offices(
+        offices,
+        kind=Notification.Kind.ROUTED,
+        title="A document is waiting for your office",
+        message=f"{record.tracking_number} was routed to the selected office.",
+        url=record.get_absolute_url(),
+        tracking_record=record,
+    )
+    return steps
+
+
+def confirm_receipt(record, *, user, note="") -> RoutingStep:
+    """Explicit receipt. Server time only — never a value typed by the user."""
+    return _confirm_receipt(record, user=user, note=note, expected_batch=record.current_batch)
+
+
+@locked_mutation
+@requires_capability('tracking', 'receive')
+def _confirm_receipt(record, *, user, note, expected_batch) -> RoutingStep:
+    refuse_viewers(user, "confirm receipt")
+    if not user.office_id:
+        raise PermissionDenied("Your account has no office, so it cannot receive documents.")
+    if record.current_batch != expected_batch:
+        raise ValidationError("The routing batch has changed. Reload the document before receiving it.")
+    if record.status in COMPLETED_STATUSES or record.status == Status.DRAFT:
+        raise ValidationError("Only a document currently awaiting receipt can be received.")
+
+    step = (
+        RoutingStep.objects.select_for_update()
+        .filter(record=record, batch=record.current_batch, to_office_id=user.office_id, received_at__isnull=True)
+        .first()
+    )
+    if step is None:
+        raise ValidationError("There is nothing to confirm for your office on this record.")
+
+    step.received_by = user
+    step.received_at = timezone.now()
+    step.receipt_note = (note or "")[:MAX_NOTE_CHARS]
+    step.save(update_fields=["received_by", "received_at", "receipt_note"])
+
+    if record.first_received_at is None:
+        record.first_received_at = step.received_at
+        record.save(update_fields=["first_received_at", "updated_at"])
+
+    add_activity(
+        record,
+        RecordActivity.Event.RECEIVED,
+        f"Receipt confirmed by {user.display_name} ({user.office.code})",
+        actor=user,
+        detail=note or "",
+    )
+    record.recalculate_status()
+    record.touch_movement()
+    log_action(
+        AuditLog.Action.RECEIVE,
+        f"{user.office.code} confirmed receipt of {record.tracking_number}",
+        actor=user,
+        target=record,
+    )
+    Notification.objects.filter(
+        tracking_record=record,
+        office_id=user.office_id,
+        kind=Notification.Kind.ROUTED,
+        resolved_at__isnull=True,
+    ).update(resolved_at=timezone.now())
+    # Keep the sender's existing reminder accurate immediately after a partial
+    # receipt, without creating another notice or changing its read state.
+    remaining_steps = list(record.current_step_queryset.filter(
+        from_office=step.from_office, received_at__isnull=True,
+    ).select_related("to_office"))
+    receipt_reminders = Notification.objects.filter(
+        tracking_record=record,
+        office=step.from_office,
+        kind=Notification.Kind.UNRECEIVED,
+        resolved_at__isnull=True,
+    )
+    if remaining_steps:
+        recipients = ", ".join(dict.fromkeys(item.to_office.name for item in remaining_steps))
+        message = f"{record.tracking_number} is awaiting receipt from {recipients}."
+        if len(message) > 255:
+            recipients = ", ".join(dict.fromkeys(item.to_office.code for item in remaining_steps))
+            message = f"{record.tracking_number} is awaiting receipt from {recipients}."
+        receipt_reminders.update(message=message[:255])
+    else:
+        receipt_reminders.update(resolved_at=timezone.now())
+    overdue_notices = Notification.objects.filter(
+        tracking_record=record,
+        kind=Notification.Kind.OVERDUE,
+        resolved_at__isnull=True,
+    )
+    if record.is_overdue:
+        title, message = overdue_notice_text(record, awaiting_receipt=False)
+        overdue_notices.filter(office_id=user.office_id).update(title=title, message=message)
+    else:
+        overdue_notices.update(resolved_at=timezone.now())
+    notify_office(
+        step.from_office, kind=Notification.Kind.RECEIVED, title="A document you sent was received",
+        message=f"{record.tracking_number} was received by {user.office.name}.",
+        url=record.get_absolute_url(), tracking_record=record,
+    )
+    return step
+
+
+@transaction.atomic
+@requires_capability('tracking', 'receive')
+def bulk_confirm_receipts(records, *, user, note="") -> list[RoutingStep]:
+    """Confirm an explicit selection while preserving one receipt event per record."""
+    requested = [(record.pk, record.current_batch) for record in records]
+    if not requested:
+        raise ValidationError("Select at least one document to receive.")
+    record_ids = {record_id for record_id, _ in requested}
+    # Match locked_mutation's account-before-record order so a concurrent
+    # individual receipt by the same user cannot deadlock with this batch.
+    actor = active_writer(user)
+    locked = {
+        record.pk: record
+        for record in TrackingRecord.objects.select_for_update().filter(pk__in=record_ids).order_by("pk")
+    }
+    if len(locked) != len(record_ids):
+        raise ValidationError("One of the selected documents is no longer available.")
+    return [
+        _confirm_receipt(locked[record_id], user=actor, note=note, expected_batch=batch)
+        for record_id, batch in requested
+    ]
+
+
+@locked_mutation
+@requires_capability('tracking', 'work')
+def add_remark(record, *, user, remark) -> RecordActivity:
+    refuse_viewers(user, "add remarks")
+    if not record.can_user_act(user):
+        raise PermissionDenied("Only the office holding the document can add remarks.")
+    remark = (remark or "").strip()
+    if not remark:
+        raise ValidationError("Write the remark before saving.")
+    # Backstop for callers that are not RemarkForm — seed data, the self check,
+    # anything added later. The detail column is a TextField, so without this a
+    # remark had no ceiling at all and a pasted document would be replayed on
+    # the record page for the rest of the record's life.
+    remark = remark[:MAX_REMARK_CHARS]
+    activity = add_activity(
+        record, RecordActivity.Event.REMARK, f"{user.display_name} added a remark", actor=user, detail=remark
+    )
+    record.recalculate_status()
+    record.touch_movement()
+    log_action(
+        AuditLog.Action.UPDATE,
+        f"Remark on {record.tracking_number}: {truncate(remark, 80)}",
+        actor=user,
+        target=record,
+    )
+    return activity
+
+
+@locked_mutation
+@requires_capability('tracking', 'work')
+def mark_in_process(record, *, user, note="") -> TrackingRecord:
+    """Declare that the office holding the document has started work on it.
+
+    Separate from the automatic promotion in `recalculate_status()` — which
+    infers In process from a remark or an attachment — so that an office with
+    nothing yet to add can still say it has picked the document up.
+    """
+    refuse_viewers(user, "change the status of documents")
+    if record.status in COMPLETED_STATUSES:
+        raise ValidationError("This record is completed and its status can no longer change.")
+    if record.status == Status.DRAFT:
+        raise ValidationError(f"A draft has not been sent yet, so it cannot be {Status.IN_PROCESS.label}.")
+    ensure_received(record)
+    if not record.can_user_act(user):
+        raise PermissionDenied("Only the office holding the document can change its status.")
+
+    work_office = user.office if record.has_custody(user.office) else record.current_office
+    if record.has_activity_after_receipt(work_office):
+        return record
+    add_activity(
+        record,
+        RecordActivity.Event.REMARK,
+        f"{user.display_name} marked the document {Status.IN_PROCESS.label}",
+        actor=user,
+        detail=note or "",
+    )
+    record.recalculate_status()
+    record.touch_movement()
+    log_action(
+        AuditLog.Action.UPDATE,
+        f"{record.tracking_number} marked {Status.IN_PROCESS.label}",
+        actor=user,
+        target=record,
+    )
+    return record
+
+
+@locked_mutation
+@requires_capability('tracking', 'complete')
+def complete_record(record, *, user, note="") -> TrackingRecord:
+    """Finish the work. The record stays in Tracking awaiting approval.
+
+    This no longer files anything. Completion is now a claim by the office that
+    did the work, and COMPLETED_PENDING_UPLOAD is where that claim waits for an
+    administrator to check it — `approve_upload` is what turns it into a
+    repository record.
+    """
+    refuse_viewers(user, "complete documents")
+    if record.status in COMPLETED_STATUSES:
+        if user.is_system_admin or (record.can_user_view(user) and user.office_id == record.current_office_id):
+            return record
+        raise PermissionDenied("Only the office holding the document can complete it.")
+    if not record.can_user_act(user):
+        raise PermissionDenied("Only the office holding the document can complete it.")
+    if record.status == Status.DRAFT:
+        raise ValidationError("Send the draft and confirm receipt before completing it.")
+    ensure_received(record, stage_label="Completed")
+    record.status = Status.COMPLETED_PENDING_UPLOAD
+    record.completed_at = timezone.now()
+    record.completed_by = user
+    record.completion_note = (note or "")[:MAX_NOTE_CHARS]
+    record.last_movement_at = record.completed_at
+    record.save(
+        update_fields=[
+            "status", "completed_at", "completed_by", "completion_note", "last_movement_at", "updated_at",
+        ]
+    )
+    add_activity(
+        record,
+        RecordActivity.Event.COMPLETED,
+        f"Marked completed by {user.display_name}",
+        actor=user,
+        detail=note or "",
+    )
+    log_action(AuditLog.Action.COMPLETE, f"Completed {record.tracking_number}", actor=user, target=record)
+    # Finishing the work answers the deadline and the chase alike: neither is
+    # outstanding any more, whoever they were addressed to.
+    resolve_for_record(
+        record,
+        kinds=[
+            Notification.Kind.ROUTED,
+            Notification.Kind.RECEIVED,
+            Notification.Kind.OVERDUE,
+            Notification.Kind.UNRECEIVED,
+        ],
+    )
+    notify_office(
+        record.originating_office, kind=Notification.Kind.COMPLETED, title="A document you originated is complete",
+        message=f"{record.tracking_number} has been marked completed.",
+        url=record.get_absolute_url(), tracking_record=record,
+    )
+    return record
+
+
+@requires_capability('tracking', 'file')
+def approve_upload(record, *, user, tag_names=None, description=""):
+    """Approve a finished record into the Document Repository.
+
+    Thin on purpose: the work is `apps.documents.services.archive_tracking_record`,
+    which owns the repository side. This exists so that Tracking has the verb —
+    approval is a tracking-lifecycle act, and callers here should not have to
+    know that filing lives in another app. Imported inside the function because
+    the documents app imports this module.
+    """
+    from apps.documents.services import archive_tracking_record
+
+    refuse_viewers(user, "approve documents into the repository")
+    if not record.can_user_approve_upload(user):
+        raise PermissionDenied(
+            "Only an administrator for this document's office can approve it "
+            "into the Document Repository."
+        )
+    return archive_tracking_record(
+        record, user=user, tag_names=tag_names, description=description
+    )
+
+
+@locked_mutation
+@requires_capability('tracking', 'reopen')
+def reopen_record(record, *, user, reason="") -> TrackingRecord:
+    """Send a completed record back into active tracking. History is kept intact.
+
+    Refuses a record that has already been filed. `is_archived` is cleared all
+    the same rather than trusted: a record carrying that flag is excluded from
+    `active()`, so reopening one without clearing it would return the record to
+    Tracking and leave it invisible there — the same limbo this is meant to
+    undo.
+
+    `completion_note` is deliberately left alone. The note explains a
+    completion that genuinely happened, and this timeline does not rewrite
+    itself; the reopening is recorded as its own entry beneath it.
+
+    `due_at` is deliberately absent from `update_fields` below, and that is the
+    whole of "reopen inherits the original deadline". No batch is routed here,
+    so nothing recomputes it: the record keeps the deadline it was carrying when
+    it was completed, which is the one the office agreed to.
+
+    The consequence is intended and worth stating. A record reopened after its
+    deadline has passed is overdue immediately — including one that was
+    completed on time and reopened a month later. That is the honest reading:
+    the work is owed again and the date it was owed by has gone. An office that
+    wants a fresh clock routes the record onward, which is the act that sets a
+    new one.
+    """
+    refuse_viewers(user, "return documents to tracking")
+    if record.status == Status.COMPLETED or record.is_archived or getattr(record, "archived_document", None):
+        raise ValidationError(
+            "This record has already been approved into the Document Repository "
+            "and cannot be returned to tracking."
+        )
+    if record.status != Status.COMPLETED_PENDING_UPLOAD:
+        return record
+    if not record.can_user_reopen(user):
+        raise PermissionDenied("Only the completing office or an authorized administrator can reopen it.")
+    record.status = Status.RECEIVED
+    record.completed_at = None
+    record.completed_by = None
+    record.is_archived = False
+    record.archived_at = None
+    record.save(
+        update_fields=[
+            "status", "completed_at", "completed_by", "is_archived", "archived_at", "updated_at",
+        ]
+    )
+    # Restores the real state from the routing steps — received, in process, or
+    # still awaiting a receipt — rather than assuming the value set above.
+    record.recalculate_status()
+    add_activity(
+        record,
+        RecordActivity.Event.REOPENED,
+        f"Returned to tracking by {user.display_name}",
+        actor=user,
+        detail=reason,
+    )
+    # Without this the record keeps the movement time of its completion and
+    # sorts to wherever that falls, instead of surfacing as freshly reopened.
+    record.touch_movement()
+    log_action(
+        AuditLog.Action.UPDATE,
+        f"Returned {record.tracking_number} to tracking",
+        actor=user,
+        target=record,
+    )
+    return record
+
+
+def grant_access(record, *, user, office=None, target_user=None, reason="") -> RecordAccessGrant:
+    from django.db import connection
+
+    from apps.accounts.models import User
+
+    # Account administration and sharing take the same global lock first.
+    with transaction.atomic():
+        with connection.cursor() as cursor:
+            cursor.execute('SELECT pg_advisory_xact_lock(%s)', [0x55444D414343])
+        has_user_recipient = target_user is not None
+        if has_user_recipient and office is None:
+            user = active_writer(user)
+            # The recipient's own record writes lock their account before the record.
+            target_user = User.objects.select_for_update(no_key=True).filter(pk=target_user.pk, is_active=True).first()
+        return _grant_access(
+            record, user=user, office=office, target_user=target_user,
+            has_user_recipient=has_user_recipient, reason=reason,
+        )
+
+
+@locked_mutation
+@requires_capability('tracking', 'share')
+def _grant_access(record, *, user, office, target_user, has_user_recipient, reason) -> RecordAccessGrant:
+    from apps.accounts.models import Office
+
+    refuse_viewers(user, "share documents")
+    if not record.can_user_grant_access(user):
+        raise PermissionDenied("Only the originating or holding office can share this record.")
+    if (office is not None) == has_user_recipient:
+        raise ValidationError("Choose exactly one office or user to grant access to.")
+    if office is not None:
+        office = Office.objects.select_for_update(no_key=True).filter(pk=office.pk, is_active=True).first()
+        if office is None:
+            raise ValidationError('Choose an active internal office.')
+    elif target_user is None:
+        raise ValidationError('Choose an active account.')
+    if user.is_office_admin and not user.is_system_admin:
+        if not user.office_id or (office is not None and office.pk != user.office_id):
+            raise PermissionDenied("You can only manage access within your own office.")
+        if target_user is not None and not user.can_administer(target_user):
+            raise PermissionDenied("You can only manage access for your own office's accounts.")
+    grant, created = RecordAccessGrant.objects.get_or_create(
+        record=record,
+        office=office,
+        user=target_user,
+        defaults={"granted_by": user, "reason": reason[:255]},
+    )
+    if created:
+        add_activity(
+            record,
+            RecordActivity.Event.ACCESS,
+            f"Access granted to {office or target_user} by {user.display_name}",
+            actor=user,
+            detail=reason,
+        )
+        log_action(
+            AuditLog.Action.PERMISSION,
+            f"Granted access to {record.tracking_number} for {office or target_user}",
+            actor=user,
+            target=record,
+        )
+        if office:
+            notify_office(
+                office, kind=Notification.Kind.SHARED, title="A document was shared with your office",
+                message=f"Access was granted to {record.tracking_number}.",
+                url=record.get_absolute_url(), tracking_record=record,
+            )
+    return grant
+
+
+# ---------------------------------------------------------------------------
+# Queue helpers used by the dashboard
+# ---------------------------------------------------------------------------
+def inbox_for(user):
+    """Documents waiting for this user's office to confirm receipt.
+
+    NOT a dashboard queue, and narrower than every one of them. This is the set
+    somebody may actually press Confirm on, which is what bulk receipt needs and
+    what `selfcheck` asserts against; the Incoming card counts
+    `apply_scope(..., SCOPE_INCOMING, ...)`, which also holds what has already
+    been received and what is being worked on.
+
+    Two sibling helpers stood here — `in_custody_for` and `outgoing_for` — and
+    the dashboard counted its cards with them while linking to the scopes, so
+    every card disagreed with the page it opened. They are gone; `apply_scope`
+    is the one definition of those queues. This one survives because confirming
+    receipt is a different question from listing a queue.
+    """
+    if not user.is_authenticated or not user.office_id:
+        return TrackingRecord.objects.none()
+    return (
+        TrackingRecord.objects.visible_to(user)
+        .filter(
+            routing_steps__to_office_id=user.office_id,
+            routing_steps__received_at__isnull=True,
+            routing_steps__batch=F("current_batch"),
+        )
+        .exclude(status__in=COMPLETED_STATUSES)
+        .with_related()
+        .distinct()
+    )
+
+
+def overdue_for(user):
+    return TrackingRecord.objects.visible_to(user).overdue().with_related().distinct()
+
+
+def completed_this_year_for(user):
+    """Counts the work finished this year, whether or not it has been approved
+    into the repository yet — approval is an administrative step that can lag by
+    weeks, and a count of completed work that waits on it would understate the
+    year every time somebody is slow to file."""
+    return (
+        TrackingRecord.objects.visible_to(user)
+        .filter(status__in=COMPLETED_STATUSES, completed_at__year=timezone.localdate().year)
+        .distinct()
+    )
+
+
+def pending_upload_for(user):
+    """Finished records waiting for an administrator to approve them."""
+    return TrackingRecord.objects.visible_to(user).pending_filing().with_related().distinct()
+
+
+def active_for(user):
+    return TrackingRecord.objects.visible_to(user).filter(status__in=ACTIVE_STATUSES).with_related().distinct()
+
+
+#: Queue names the Tracking page's `?scope=` links use.
+#:
+#: Incoming and Outgoing are derived here rather than stored on the record,
+#: because direction is not a property of a document — it is a property of a
+#: document *and an office*. The batch that is outgoing for Supply is incoming
+#: for HR at the same instant, so there is no single value a status column could
+#: hold. Keeping them out of the enum also keeps the audit trail honest: the
+#: timeline records acts, and "incoming" is not an act anybody performed.
+SCOPE_INCOMING = "incoming"
+SCOPE_OUTGOING = "outgoing"
+SCOPE_PENDING_RECEIPT = "pending-receipt"
+SCOPE_RECEIVED = "received"
+#: The other half of SCOPE_RECEIVED. A scope and not a `?status=` pill: a
+#: status-based pill in this row is what put another office's records in your
+#: Received queue once already, because a status says nothing about who is
+#: holding the document. This asks the same custody question its neighbours do
+#: and then narrows by stage.
+SCOPE_IN_PROCESS = "in-process"
+SCOPE_OVERDUE = "overdue"
+#: The completed-but-unapproved queue. It lives on this page rather than on the
+#: repository page because the records in it have not reached the repository —
+#: approving them is what puts them there.
+SCOPE_PENDING_UPLOAD = "pending-upload"
+#: Older names, kept only so saved bookmarks still resolve. Nothing in the app
+#: links to them any more.
+#:
+#: They are NOT synonyms for the queues that replaced them, and a comment here
+#: used to say they were:
+#:
+#:   inbox   is narrower than incoming — unconfirmed steps only, where incoming
+#:           spans pending receipt, received and in process
+#:   sent    is narrower than outgoing — drops a document the moment somebody
+#:           confirms it, where outgoing keeps what left the office
+#:   custody is *wider* than received — the office recorded on the record or
+#:           any holder with a receipt in the current batch, regardless of stage
+#:
+#: Measured on the demo data, one office: inbox 9 against incoming 5, sent 15
+#: against outgoing 7. Anything pointed at an alias by mistake shows a
+#: different queue from the one its label promises.
+SCOPE_INBOX = "inbox"
+SCOPE_AWAITING = "awaiting"
+SCOPE_CUSTODY = "custody"
+SCOPE_SENT = "sent"
+SCOPE_MINE = "mine"
+
+#: Records per page wherever tracking records are listed, when the reader has
+#: not asked for another size. Lives here rather than on one of the two views
+#: that page them, so the Tracking workspace and the unified search page cannot
+#: drift to different page sizes.
+#:
+#: Taken from apps.core.pagination rather than set to a number of its own: the
+#: size control lights the option matching the current size, and a default that
+#: is not one of the offered sizes leaves every option looking unselected.
+PAGE_SIZE = DEFAULT_PAGE_SIZE
+
+
+#: `overdue_q` — the one definition of "past its deadline" — is imported from
+#: .models above, where the queryset's `.overdue()` can use it too, and is used
+#: from here by the queues, the filters and the reports.
+
+
+def on_time_q():
+    """Everything that is not overdue — stated, not negated.
+
+    `.exclude(due_at__lt=now)` looks equivalent and is not: it throws out every
+    record whose deadline passed *before the work finished*, which is neither
+    overdue nor on time under that expression and so appears under neither
+    filter. Measured on 280 records, the naive version returned 13 where this
+    returns 248, losing 235 rows from a page offering only those two choices.
+
+    A document finished after its deadline is not late — nothing is owed on it —
+    so it belongs here, with the ones that have no deadline at all.
+    """
+    return (
+        Q(due_at__isnull=True)
+        | Q(due_at__gte=timezone.now())
+        | Q(status__in=COMPLETED_STATUSES)
+    )
+
+
+def order_records(records, sort=""):
+    """The workspace, Search and its export use the same stable ordering."""
+    from .forms import SORT_DEADLINE_ASC, SORT_DEADLINE_DESC
+
+    ordering = {
+        SORT_DEADLINE_ASC: (F("due_at").asc(nulls_last=True), "-last_movement_at"),
+        SORT_DEADLINE_DESC: (F("due_at").desc(nulls_last=True), "-last_movement_at"),
+    }.get(sort, ("-last_movement_at",))
+    return records.distinct().order_by(*ordering, "-pk")
+
+
+def filter_records(records, *, query=None, status=None, offices=None, overdue=None):
+    """Free-text, stage and originating-office filtering for tracking records.
+
+    Kept here rather than inline in a view because two pages need it: the
+    Tracking workspace and the tracking half of the unified search page. Both
+    query boxes narrow the chosen queue through this same implementation.
+
+    Scope narrowing is deliberately *not* here. It depends on the user, this
+    does not, and the queues compose with these filters rather than replacing
+    them — callers apply `apply_scope()` afterwards.
+
+    A draft matches on its placeholder tracking number, which is never
+    displayed. That is not a leak: `visible_to` already limits a draft to the
+    person writing it, so the only person who can match one that way is its
+    author searching their own unsent work.
+    """
+    if "stage" not in records.query.annotations:
+        records = records.with_stage_for()
+    if query:
+        records = records.filter(
+            Q(tracking_number__icontains=query)
+            | Q(subject__icontains=query)
+            | Q(originating_office__name__icontains=query)
+            | Q(originating_office__code__icontains=query)
+            | Q(current_office__name__icontains=query)
+            | Q(current_office__code__icontains=query)
+        )
+    if status:
+        # A list or a single value, so a caller holding one stage need not wrap
+        # it. `?status=` became repeatable when the stages turned into a
+        # multi-select row; a lone string here would have filtered on its first
+        # character through __in.
+        wanted = [status] if isinstance(status, str) else list(status)
+        field = "stage" if "stage" in records.query.annotations else "status"
+        records = records.filter(**{f"{field}__in": wanted})
+    # Independent of the stage, which is the point: a record can be pending
+    # receipt *and* overdue, and "overdue" used to occupy the status parameter
+    # so the two could not both be asked for.
+    if overdue == "yes":
+        records = records.filter(overdue_q())
+    elif overdue == "no":
+        records = records.filter(on_time_q())
+    if offices:
+        records = records.filter(originating_office__in=offices)
+    return records
+
+
+# ---------------------------------------------------------------------------
+# How long an office has to act
+# ---------------------------------------------------------------------------
+def resolve_sla_due_days(office, document_type) -> int:
+    """Days the receiving office has to act, from the SLA table.
+
+    The single place the table is read. Nothing else may query `RoutingSLA` —
+    a second reader is a second precedence order, and the two drift.
+
+    Four tiers, most specific first::
+
+        (office, document_type)   this office, this kind of document
+        (office, NULL)            this office's house rule for anything
+        (NULL, document_type)     a university-wide rule for one kind
+        no row                    settings.DEFAULT_ACTION_DUE_DAYS
+
+    Inactive rows are skipped rather than treated as "no deadline", so
+    unticking a rule falls through to the next tier — which is what an
+    administrator means by unticking it. Returning 0 there would silently
+    remove the deadline instead of removing the exception.
+
+    Ordered in the database rather than fetched-and-sorted: one query, and the
+    ordering *is* the precedence, so it cannot be restated differently by a
+    caller. `office_rank` and `type_rank` put an exact match first because
+    NULLS LAST on both columns is precisely "most specific wins".
+    """
+    from django.db.models import Case, IntegerField, Value, When
+
+    office_id = getattr(office, "pk", None)
+    type_id = getattr(document_type, "pk", None)
+
+    scopes = Q()
+    if office_id and type_id:
+        scopes |= Q(office_id=office_id, document_type_id=type_id)
+    if office_id:
+        scopes |= Q(office_id=office_id, document_type__isnull=True)
+    if type_id:
+        scopes |= Q(office__isnull=True, document_type_id=type_id)
+    if not scopes:
+        return settings.DEFAULT_ACTION_DUE_DAYS
+
+    match = (
+        RoutingSLA.objects.filter(scopes, is_active=True)
+        .annotate(
+            specificity=Case(
+                When(office__isnull=False, document_type__isnull=False, then=Value(0)),
+                When(office__isnull=False, then=Value(1)),
+                default=Value(2),
+                output_field=IntegerField(),
+            )
+        )
+        .order_by("specificity")
+        .values_list("due_days", flat=True)
+        .first()
+    )
+    return settings.DEFAULT_ACTION_DUE_DAYS if match is None else match
+
+
+def sla_due_days_for(offices, document_type) -> int:
+    """The strictest SLA across every office a batch is going to.
+
+    `route_record` writes one `due_at` for the whole batch — the same value on
+    every step and on the record — so when a batch goes to two offices with
+    different rules, one number has to win. The shortest does: the record is
+    late the moment the first office is late, and `record.due_at` is what the
+    overdue queue, the dashboard card and the accountability panel all read.
+
+    Taking the longest instead would let a slow office's rule hide a fast
+    office's breach, which is the opposite of what a deadline is for.
+    """
+    days = [resolve_sla_due_days(office, document_type) for office in offices]
+    return min(days) if days else settings.DEFAULT_ACTION_DUE_DAYS
+
+
+# ---------------------------------------------------------------------------
+# Who owes the next move
+# ---------------------------------------------------------------------------
+def _current_batch_steps(**extra):
+    """RoutingStep subquery bound to the outer record's current batch."""
+    return RoutingStep.objects.filter(
+        record=OuterRef("pk"), batch=OuterRef("current_batch"), **extra
+    )
+
+
+def overdue_accountability(records, whole=None):
+    """Overdue work grouped by the office that owes the next move.
+
+    Deliberately not `current_office`. `recalculate_status()` sets that to the
+    *sending* office while a batch is unreceived, because that is the last office
+    with confirmed custody — the right answer to "where is the paper", the wrong
+    answer to "who do we chase". An office that has already handed a document
+    over cannot confirm receipt of it; only the recipient can. Grouping the
+    chase-list by custody is what made a report accuse MED of sitting on a
+    document MED had already sent to SUP and PROC.
+
+    Two kinds of debt, reported separately because they need different actions:
+
+      awaiting — a step in the current batch nobody has received. Owed by each
+                 unreceived `to_office`. Chase them for a receipt.
+      holding  — each confirmed receiving office in the current batch has
+                 custody and can act. Chase each of them for the action.
+
+    A record can appear in both when a batch went to several offices and only
+    some confirmed, and one awaiting record can raise rows against two offices.
+    The counts are therefore per office, not a partition of the overdue total —
+    the caller must label them that way.
+
+    Each bar is a share of `whole`, the number of overdue documents, which is
+    the question the panel answers: how much of the late work is this office's
+    to move. Pass it when the caller has already counted it; otherwise it is
+    counted here. Because of the overlap above the bars can add up to more than
+    one full track, and the caller says so when they do.
+    """
+    overdue = _overdue_scope(records)
+    if whole is None:
+        whole = overdue.count()
+
+    awaiting = {
+        (row["to_office__code"], row["to_office__name"]): row["total"]
+        for row in RoutingStep.objects.filter(
+            record__in=overdue,
+            received_at__isnull=True,
+            batch=F("record__current_batch"),
+        )
+        .order_by()
+        .values("to_office__code", "to_office__name")
+        .annotate(total=Count("record", distinct=True))
+    }
+
+    holding = {
+        (row["to_office__code"], row["to_office__name"]): row["total"]
+        for row in RoutingStep.objects.filter(
+            record__in=overdue, received_at__isnull=False, batch=F("record__current_batch"),
+        )
+        .order_by()
+        .values("to_office__code", "to_office__name")
+        .annotate(total=Count("record", distinct=True))
+    }
+
+    rows = []
+    for key in sorted(set(awaiting) | set(holding)):
+        code, name = key
+        rows.append(
+            {
+                "code": code,
+                "name": name or code,
+                "awaiting": awaiting.get(key, 0),
+                "holding": holding.get(key, 0),
+                "total": awaiting.get(key, 0) + holding.get(key, 0),
+            }
+        )
+    rows.sort(key=lambda row: row["total"], reverse=True)
+
+    for row in rows:
+        row["awaiting_percent"] = _bar(row["awaiting"], whole)
+        row["holding_percent"] = _bar(row["holding"], whole)
+    return rows
+
+
+def overdue_unattributed(records):
+    """Overdue records with nobody to charge.
+
+    No unreceived step in the current batch and no confirmed holder either.
+    Should be zero. Reported rather than dropped, because a silent gap between
+    the headline total and the panel is exactly the kind of thing a defence
+    panel asks about — and a zero that is *shown* to be zero is evidence, where
+    a zero that is merely absent is an assumption.
+    """
+    return (
+        _overdue_scope(records)
+        .annotate(
+            _awaited=Exists(_current_batch_steps(received_at__isnull=True)),
+            _held=Exists(_current_batch_steps(received_at__isnull=False)),
+        )
+        .filter(_awaited=False, _held=False)
+        .distinct()
+        .count()
+    )
+
+
+def _overdue_scope(records):
+    """Past the deadline with work still owed, through the one definition.
+
+    `overdue_q()` rather than a second expression, so the panel and the headline
+    figure cannot drift — which is the whole reason that helper exists.
+    """
+    return records.filter(overdue_q()).distinct()
+
+
+def _bar(part: int, whole: int) -> int:
+    """Bar width as a share of `whole`, floored so a 1 is visible.
+
+    Floored at 1%, as `core.analytics.bar` is. It was 4% while bars were drawn
+    against the longest row, where it only lifted the stubs; against the whole,
+    4% would draw one document in a hundred four times its size.
+    """
+    if not whole:
+        return 0
+    return max(1, round(part * 100 / whole)) if part else 0
+
+
+# ---------------------------------------------------------------------------
+# Which way a document is moving, and for whom
+# ---------------------------------------------------------------------------
+#: Direction is a property of a document *and* an office — the batch that is
+#: outgoing for Supply is incoming for HR at the same instant — so it is derived
+#: against a named office rather than stored on the record.
+DIRECTION_INCOMING = "INCOMING"
+DIRECTION_OUTGOING = "OUTGOING"
+DIRECTION_UNSET = ""
+
+#: What the third bucket is called on screen. Named here so the service and the
+#: template cannot describe the same rows differently.
+DIRECTION_OTHER_LABEL = "Passed on — not in this office's hands this hop"
+
+
+def direction_annotation(office):
+    """`Case` expression tagging each record Incoming/Outgoing against `office`.
+
+    Current batch only, so the tag answers "which way is this moving now", not
+    "did this office ever touch it". A record whose only involvement with
+    `office` was an earlier hop gets DIRECTION_UNSET — reported as its own
+    bucket, never folded into either side, because calling a document the office
+    has already passed on "outgoing" would put it back on their pile.
+
+    Incoming and outgoing cannot both be true: `route_record()` refuses a step
+    whose from_office equals its to_office. Incoming is checked first anyway, so
+    a future bug there produces a wrong tag rather than a crash.
+
+    None when there is no office, so a caller branches on it once rather than
+    inventing a split it has no point of view to compute.
+    """
+    if office is None:
+        return None
+    return Case(
+        When(
+            Exists(_current_batch_steps(to_office=office)),
+            then=Value(DIRECTION_INCOMING),
+        ),
+        When(
+            Exists(_current_batch_steps(from_office=office)),
+            then=Value(DIRECTION_OUTGOING),
+        ),
+        default=Value(DIRECTION_UNSET),
+        output_field=CharField(),
+    )
+
+
+def direction_totals(records, office) -> dict:
+    """How many records are moving each way, measured from `office`."""
+    counts = {"incoming": 0, "outgoing": 0, "other": 0}
+    annotation = direction_annotation(office)
+    if annotation is None:
+        return counts
+    rows = (
+        records.annotate(_direction=annotation)
+        .order_by()
+        .values("_direction")
+        .annotate(total=Count("id", distinct=True))
+    )
+    for row in rows:
+        key = {
+            DIRECTION_INCOMING: "incoming",
+            DIRECTION_OUTGOING: "outgoing",
+        }.get(row["_direction"], "other")
+        counts[key] += row["total"]
+    return counts
+
+
+def by_status_direction(records, office) -> list[dict]:
+    """One row per live status, split by direction against `office`.
+
+    Returns the same shape whether or not there is an office: without one the
+    direction columns are zero and `total` still carries the row, so the caller
+    renders one table rather than two and the template has no branch of its own.
+    """
+    annotation = direction_annotation(office)
+    live = records.with_stage_for(office).filter(status__in=ACTIVE_STATUSES).exclude(status=Status.DRAFT)
+
+    tally: dict[str, dict] = {}
+    if annotation is None:
+        # `.order_by()` because Reports hands this a `.distinct()` queryset, and
+        # distinct puts Meta.ordering in the GROUP BY: a row per record, and the
+        # assignment below kept the last. Every status read 1 for a system
+        # administrator viewing every office.
+        rows = live.order_by().values("stage").annotate(total=Count("id", distinct=True))
+        for row in rows:
+            tally[row["stage"]] = {
+                "incoming": 0, "outgoing": 0, "other": 0, "total": row["total"],
+            }
+    else:
+        rows = (
+            live.annotate(_direction=annotation)
+            .order_by()
+            .values("stage", "_direction")
+            .annotate(total=Count("id", distinct=True))
+        )
+        for row in rows:
+            bucket = tally.setdefault(
+                row["stage"], {"incoming": 0, "outgoing": 0, "other": 0, "total": 0}
+            )
+            key = {
+                DIRECTION_INCOMING: "incoming",
+                DIRECTION_OUTGOING: "outgoing",
+            }.get(row["_direction"], "other")
+            bucket[key] += row["total"]
+            bucket["total"] += row["total"]
+
+    labels = dict(Status.choices)
+    return [
+        {"status": status, "label": labels.get(status, status), **tally[status]}
+        for status in (value for value, _ in Status.choices)
+        if status in tally
+    ]
+
+
+#: Scopes that answer *for an office* rather than for a queryset. The picker
+#: swaps which office they answer for; everything else it narrows by the
+#: originating/current pairing instead — see `scope_office`.
+OFFICE_SCOPED = {
+    SCOPE_INBOX, SCOPE_CUSTODY, SCOPE_SENT,
+    SCOPE_INCOMING, SCOPE_OUTGOING, SCOPE_PENDING_RECEIPT, SCOPE_RECEIVED,
+    SCOPE_AWAITING, SCOPE_IN_PROCESS,
+}
+
+
+#: "Every office", as opposed to a named one or none at all. A sentinel rather
+#: than None, because None already means "nobody picked, fall back to the
+#: viewer's own office" and the two have to stay tellable apart — conflating
+#: them is how Overdue once went from 32 records to 3.
+#:
+#: System administrators only. An office administrator's rights stop at their
+#: own office, so "every office" is not theirs to ask for — and their picker
+#: does not offer it, so the gate and the control agree.
+#:
+#: A sentinel rather than None, because None already means "nobody picked, fall
+#: back to the viewer's own office" and the two have to stay tellable apart.
+ALL_OFFICES = "__all__"
+
+
+def scope_office(user, requested):
+    """Which office the per-office queues answer for.
+
+    None unless a system administrator named one. Same gate as the dashboard's
+    scope picker — `is_system_admin` — and defined here so the dashboard and the
+    Tracking page cannot answer it differently. Two answers to "whose queue is
+    this" is the shape of bug this module has already had once.
+
+    None rather than the viewer's own office on purpose. `apply_scope` falls
+    back to the viewer for the queues that need *an* office, and the caller can
+    tell "nobody picked one" from "somebody picked mine" — which matters,
+    because narrowing a page to the viewer's office when nobody asked is how
+    Overdue went from 32 records to 3.
+
+    Naming an office grants nothing. It is applied on top of `visible_to`, never
+    instead of it, so it can only narrow what the viewer already sees. Active
+    office IDs and codes resolve identically on every consumer. Unknown values
+    and requests from accounts without the picker return None; page-level
+    resolvers apply the role's default and report invalid selections.
+    """
+    raw = str(requested or "").strip()
+    if not getattr(user, "is_system_admin", False):
+        return None
+    if raw == "all":
+        return ALL_OFFICES if getattr(user, "is_system_admin", False) else None
+    from apps.core.filters import _office_by_pk_or_code
+
+    return _office_by_pk_or_code(raw)
+
+
+def office_queue(records, scope, user, office=None):
+    """A queue exactly as the Tracking page lists it, for `office`.
+
+    `office` is an Office, `ALL_OFFICES`, or None for the viewer's own. For a
+    queue that answers *for* an office (OFFICE_SCOPED) the office named
+    replaces the viewer's inside `apply_scope`. For one that does not, Overdue
+    and Pending upload, there is no such office to replace, so a named office
+    narrows by everything it touched (`office_touches_record_q`).
+
+    The one place that rule is written. The Tracking page and Search each wrote
+    it out, and the dashboard's Action Centre, which did not, counted every
+    overdue document for an office whose Tracking page listed none.
+    """
+    from apps.core.filters import office_touches_record_q
+
+    if office is not None and office is not ALL_OFFICES and scope not in OFFICE_SCOPED:
+        records = records.filter(office_touches_record_q(office))
+    return apply_scope(records, scope, user, office=office)
+
+
+def apply_scope(records, scope, user, office=None):
+    """Narrow a record queryset to one of the Tracking page's queues.
+
+    Kept here rather than inline in the view so the queues have one definition,
+    and so every office-based queue gets the same guard: a user with no office
+    matches nothing, instead of `to_office_id=None` quietly matching no rows in
+    a way that looks like an empty database.
+
+    `office` is which office the queues answer for, defaulting to the viewer's
+    own. The dashboard's picker passes the selected one so that "Incoming" reads
+    as that office's incoming rather than the administrator's, and the card's
+    link carries it so the page shows the queue the number counted.
+    """
+    every_office = office is ALL_OFFICES
+    office_id = None if every_office else (getattr(office, "pk", None) or user.office_id)
+
+    # The office term as a Q, so "every office" is the empty one and each queue
+    # below reads the same either way. Branching per queue would be seven places
+    # to forget, which is how these predicates drifted apart before.
+    to_office = Q() if every_office else Q(routing_steps__to_office_id=office_id)
+    from_office = Q() if every_office else Q(routing_steps__from_office_id=office_id)
+
+    if scope == SCOPE_AWAITING:
+        # Returned before the office branch, so the picker used to narrow it
+        # through the view's generic originating-or-current fallback — the one
+        # queue scoped by a rule no other queue used. It has a predicate of its
+        # own now, in the same shape as the others.
+        #
+        # Broader than pending-receipt on purpose, which is why it survives the
+        # two-directional fix: this ignores status, so a batch where one office
+        # has confirmed and another has not still counts as awaiting somebody.
+        if not office_id and not every_office:
+            return awaiting_receipt(records, user)
+        return records.filter(
+            to_office | from_office,
+            routing_steps__received_at__isnull=True,
+            routing_steps__batch=F("current_batch"),
+        ).exclude(status__in=COMPLETED_STATUSES)
+    if scope == SCOPE_MINE:
+        return records.filter(created_by=user)
+    if scope == SCOPE_OVERDUE:
+        # Kept as a queue because the pill is a useful shortcut, but it delegates
+        # rather than repeating the expression — one definition of overdue in the
+        # query layer, or the pill and the filter drift.
+        #
+        # Not office-scoped: `visible_to` has already limited the set to records
+        # this user has something to do with, and an overdue document sitting in
+        # another office is precisely what the person who sent it needs to see.
+        return records.filter(overdue_q())
+    if scope == SCOPE_PENDING_UPLOAD:
+        return records.filter(
+            status=Status.COMPLETED_PENDING_UPLOAD, archived_document__isnull=True
+        )
+
+    if scope not in OFFICE_SCOPED:
+        return records
+    if not office_id and not every_office:
+        return records.none()
+
+    if scope == SCOPE_INCOMING:
+        # Everything addressed to this office in the current batch, whether or
+        # not the receipt has been confirmed — Pending receipt, Received and
+        # In process together, which is what "our incoming" means to a clerk.
+        return records.filter(
+            to_office,
+            routing_steps__batch=F("current_batch"),
+        ).exclude(status__in=COMPLETED_STATUSES)
+    if scope == SCOPE_OUTGOING:
+        # Everything this office sent onward in the current batch. Unlike the
+        # older "sent" queue this does not drop a document the moment somebody
+        # confirms it: what left the office is still what left the office.
+        return records.filter(
+            from_office,
+            routing_steps__batch=F("current_batch"),
+        ).exclude(status__in=COMPLETED_STATUSES)
+    if scope == SCOPE_PENDING_RECEIPT:
+        # Both directions: what this office owes a receipt on, and what it sent
+        # that nobody has signed for yet. The second half was missing, so the
+        # one queue whose whole job is "who has not confirmed" could not answer
+        # it for the office doing the asking.
+        #
+        # One .filter() call, not two. Split across two calls each condition
+        # binds to a *different* routing step, so a record with any unconfirmed
+        # step and any step to or from this office would match — which is a
+        # wider queue than either half.
+        #
+        # The Confirm Receipt button stays correct on its own: annotate_can_confirm
+        # checks to_office_id independently, so the outgoing rows joining this
+        # queue show no button.
+        return records.filter(
+            to_office | from_office,
+            routing_steps__received_at__isnull=True,
+            routing_steps__batch=F("current_batch"),
+        ).exclude(status__in=COMPLETED_STATUSES)
+    if scope == SCOPE_IN_PROCESS:
+        # SCOPE_RECEIVED with the stage pinned. Same custody predicate, so the
+        # two pills are halves of one queue rather than two different questions
+        # sitting next to each other.
+        return records.with_stage_for(office_id).filter(
+            to_office,
+            stage=Status.IN_PROCESS,
+            routing_steps__received_at__isnull=False,
+            routing_steps__batch=F("current_batch"),
+        )
+    if scope == SCOPE_RECEIVED:
+        # RECEIVED only. It matched (RECEIVED, IN_PROCESS), which made this
+        # queue a superset of the In Process pill sitting beside it: a record
+        # somebody had started work on appeared under both, so the two counts
+        # overlapped and "Received" answered a question nobody asked — "received
+        # or started". Signed for and not yet started is a real queue and the
+        # one this pill is named for; In Process is its other half, and the two
+        # are now disjoint.
+        return records.with_stage_for(office_id).filter(
+            to_office,
+            stage=Status.RECEIVED,
+            routing_steps__received_at__isnull=False,
+            routing_steps__batch=F("current_batch"),
+        )
+    if scope == SCOPE_INBOX:
+        return records.filter(
+            to_office,
+            routing_steps__received_at__isnull=True,
+            routing_steps__batch=F("current_batch"),
+        ).exclude(status__in=COMPLETED_STATUSES)
+    if scope == SCOPE_CUSTODY:
+        if every_office:
+            return records.filter(current_office__isnull=False)
+        # The cached office covers drafts and the sender before the first
+        # receipt. After receipt it only records the last office to confirm.
+        confirmed = Exists(_current_batch_steps(to_office_id=office_id, received_at__isnull=False))
+        return records.filter(Q(current_office_id=office_id) | Q(confirmed))
+    return records.filter(
+        from_office,
+        routing_steps__received_at__isnull=True,
+        routing_steps__batch=F("current_batch"),
+    ).exclude(status__in=COMPLETED_STATUSES)
+
+
+def awaiting_receipt(records, user):
+    """Documents somebody still has to confirm receipt of.
+
+    One definition for everybody: anything the user can see that still has an
+    unconfirmed recipient in its current batch. `visible_to` has already
+    narrowed the set to records their office actually touched, so this needs no
+    role split of its own.
+
+    It used to have one, and that is what made this queue useless for most
+    people: ordinary users were quietly redirected to their own inbox, so
+    "Pending Receipt" returned exactly the same rows as "Incoming" and the two
+    links sat next to each other doing the same thing. The office waiting on a
+    document it *sent* could not see that it was still unconfirmed — which is
+    the one question this queue exists to answer.
+
+    Broader than filtering on AWAITING_RECEIPT_STATUSES, deliberately: when a
+    batch goes to several offices and only one confirms, the record reads
+    RECEIVED while a recipient still owes a receipt. That record belongs here.
+    """
+    if not user.is_authenticated:
+        return records.none()
+    return records.filter(
+        routing_steps__received_at__isnull=True,
+        routing_steps__batch=F("current_batch"),
+    ).exclude(status__in=COMPLETED_STATUSES)
+
+
+#: Office badges shown in a receipt cell before it collapses to "+N".
+RECEIVING_SHOWN = 3
+
+
+def annotate_receiving_offices(records, steps=None, *, shown=RECEIVING_SHOWN) -> None:
+    """Attach endorsement and receipt facts for each record's current batch.
+
+    Endorsed offices include every recipient. Confirmed offices have a receipt;
+    awaiting offices have none and only apply while the record is active. The
+    cached `current_office` is deliberately not used as a receipt: it can still
+    identify the sender and only retains one office in a parallel batch.
+
+    One grouped query supplies receipt fields and all office badge fields, so
+    rendering does not fetch deferred fields per row. Detail pages can supply
+    their already loaded steps instead. Existing destination attributes remain
+    available for metadata, including on completed records.
+    """
+    if not records:
+        return
+    if steps is None:
+        # Match the batch already displayed on each row. A new endorsement
+        # committed during rendering must not make that row's receipts vanish.
+        records_by_batch = {}
+        for record in records:
+            records_by_batch.setdefault(record.current_batch, []).append(record.pk)
+        displayed_batches = Q()
+        for batch, record_ids in records_by_batch.items():
+            displayed_batches |= Q(record_id__in=record_ids, batch=batch)
+        steps = (
+            RoutingStep.objects.filter(displayed_batches)
+            .select_related("to_office")
+            .only(
+                "record_id", "batch", "received_at", "to_office_id",
+                "to_office__code", "to_office__name", "to_office__colour",
+            )
+        )
+    by_record: dict[int, list] = {}
+    for step in steps:
+        by_record.setdefault(step.record_id, []).append(step)
+
+    for record in records:
+        offices_by_id, confirmed_ids = {}, set()
+        for step in by_record.get(record.pk, []):
+            if step.batch != record.current_batch:
+                continue
+            offices_by_id.setdefault(step.to_office_id, step.to_office)
+            if step.received_at is not None:
+                confirmed_ids.add(step.to_office_id)
+
+        endorsed = list(offices_by_id.values())
+        confirmed = [office for office_id, office in offices_by_id.items() if office_id in confirmed_ids]
+        active = record.status != Status.DRAFT and record.status not in COMPLETED_STATUSES
+        awaiting = [
+            office for office_id, office in offices_by_id.items()
+            if active and office_id not in confirmed_ids
+        ]
+        record.endorsed_offices = endorsed
+        record.confirmed_receipt_offices = confirmed
+        record.awaiting_receipt_offices = awaiting
+        record.receiving_offices_shown = endorsed[:shown]
+        record.receiving_more = max(0, len(endorsed) - shown)
+        record.confirmed_receipt_offices_shown = confirmed[:shown]
+        record.confirmed_receipt_more = max(0, len(confirmed) - shown)
+        record.pending_receipt_offices_shown = awaiting[:shown]
+        record.pending_receipt_more = max(0, len(awaiting) - shown)
+
+        if record.status == Status.DRAFT:
+            record.receipt_wait_label = "Not sent yet"
+        elif record.status == Status.COMPLETED_PENDING_UPLOAD:
+            record.receipt_wait_label = "Work completed"
+        elif record.status == Status.COMPLETED:
+            record.receipt_wait_label = "Filed in repository"
+        elif not endorsed:
+            record.receipt_wait_label = "No endorsement recorded"
+        elif not awaiting:
+            record.receipt_wait_label = "All receipts confirmed"
+        else:
+            record.receipt_wait_label = "Awaiting receipt"
+
+
+def annotate_stage(records, user, office=None) -> None:
+    """Batch-load the same stage used by queues, retaining selected perspective."""
+    if not records:
+        return
+    effective = office
+    if effective == ALL_OFFICES:
+        effective = None
+    elif effective is None:
+        effective = getattr(user, "office", None)
+    office_id = getattr(effective, "pk", effective)
+    missing = [record for record in records
+               if "stage" not in record.__dict__ or getattr(record, "_stage_office_id", object()) != office_id]
+    stages = {}
+    if missing:
+        rows = TrackingRecord.objects.filter(pk__in=[record.pk for record in missing]).with_stage_for(effective)
+        stages = dict(rows.values_list("pk", "stage"))
+    for record in records:
+        record.stage = stages.get(record.pk, getattr(record, "stage", record.status))
+        record._stage_office_id = office_id
+        record.stage_url = record.get_absolute_url()
+        if getattr(user, "is_system_admin", False) and office is not None:
+            value = "all" if office == ALL_OFFICES else getattr(office, "pk", office)
+            record.stage_url += f"?office={value}"
+
+
+def annotate_direction(records, user, office=None) -> None:
+    """Set `direction` on each record: "incoming", "outgoing" or "".
+
+    Direction is not a property of a document — it is a property of a document
+    *and* an office. The batch that is outgoing for Supply is incoming for HR at
+    the same instant, so there is no column this could live in.
+
+    Derived from the current batch with the same predicate `apply_scope` uses
+    for the Incoming and Outgoing queues, so a row's tag and the queue that
+    would list it can never disagree.
+
+    Blank for records the office neither sent nor received. A records officer or
+    an administrator sees those, and giving them a direction they do not have
+    would be a worse answer than giving them none.
+
+    `office` is which office the row is described *from*, and it has to be the
+    same value `apply_scope` was given — the two answer the same question and a
+    row's tag must agree with the queue it is sitting in. Tagged from the
+    viewer's office while the queue was built for another, every row of a page
+    headed "Supply's Incoming" read Outgoing.
+
+    ALL_OFFICES blanks every tag, and that is the honest answer rather than a
+    gap. "Incoming" means arriving *at us*; a page answering for every office
+    has no us, so a record moving MED to SUP is neither. Falling back to the
+    viewer's own office there was worse than blank: a system administrator
+    reading the whole university saw three rows in twenty tagged, and those
+    three described their own office rather than the queue on screen — so
+    `?scope=incoming` displayed rows marked Outgoing.
+
+    One grouped query, like `annotate_can_confirm` beside it — the per-row
+    version is twenty queries on a twenty-row page.
+    """
+    if not records:
+        return
+    if office is ALL_OFFICES:
+        for record in records:
+            record.direction = ""
+        return
+    office_id = getattr(office, "pk", None) or getattr(user, "office_id", None)
+    if not getattr(user, "is_authenticated", False) or not office_id:
+        for record in records:
+            record.direction = ""
+        return
+
+    incoming, outgoing = set(), set()
+    rows = RoutingStep.objects.filter(
+        record__in=records, batch=F("record__current_batch")
+    ).values_list("record_id", "from_office_id", "to_office_id")
+    for record_id, from_office_id, to_office_id in rows:
+        if to_office_id == office_id:
+            incoming.add(record_id)
+        if from_office_id == office_id:
+            outgoing.add(record_id)
+
+    for record in records:
+        # Incoming wins if a record were ever both. It cannot be today —
+        # route_record refuses to send an office its own document, and every
+        # step in a batch shares a from_office — but "it is here for us to act
+        # on" is the more useful of the two answers if routing ever changes.
+        if record.pk in incoming:
+            record.direction = "incoming"
+        elif record.pk in outgoing:
+            record.direction = "outgoing"
+        else:
+            record.direction = ""
+
+
+def annotate_can_confirm(records, user) -> None:
+    """Set `can_confirm_now` on each record in one query.
+
+    `record.can_user_confirm_receipt(user)` asks the database per record, which
+    on a twenty-row page is twenty queries for a question one `IN` clause can
+    answer. The lists that show a Confirm Receipt button use this instead.
+    """
+    if not records:
+        return
+    if not user.is_authenticated or not user.can_start_work or not user.office_id:
+        for record in records:
+            record.can_confirm_now = False
+        return
+
+    # A record is confirmable when the *current* batch still has an unreceived
+    # step addressed to this office — the same rule as pending_step_for_office.
+    pending = set(
+        RoutingStep.objects.filter(
+            record__in=records,
+            to_office_id=user.office_id,
+            received_at__isnull=True,
+            batch=F("record__current_batch"),
+        ).exclude(record__status__in={Status.DRAFT, *COMPLETED_STATUSES}).values_list("record_id", flat=True)
+    )
+    for record in records:
+        record.can_confirm_now = record.pk in pending

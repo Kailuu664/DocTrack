@@ -1,0 +1,408 @@
+{% extends "base.html" %}
+{% load doctrack %}
+{% block title %}Document Tracking · {{ SITE_NAME }}{% endblock %}
+{% block content %}
+<div class="page-head">
+  <div>
+    <div class="eyebrow">Document Tracking</div>
+    {% comment %}
+      "Active" is gone: the page shows completed-pending-upload records too, so
+      the word was describing a filter the page no longer applies.
+    {% endcomment %}
+    <h1>Document Tracking</h1>
+    <p class="sub">Tracking records, including drafts and completed work awaiting filing in the Document Repository.</p>
+  </div>
+  {% comment %}
+    Hidden from the accounts RecordCreateView would turn away — a viewer, and an
+    account with no office. Hiding it is not the permission: the view still
+    refuses the request on its own, and the URL stays reachable to anyone who
+    knows it. This only stops offering a button that answers with a redirect.
+  {% endcomment %}
+  {% if can_start_work and access.tracking.create %}
+    <a class="btn btn-udm" href="{% url 'tracking:create' %}">+ New Tracking Slip</a>
+  {% endif %}
+</div>
+{% include "tracking/_subtabs.html" with active="tracking" %}
+<form id="tracking-search-filters" method="get" class="card-udm mb-3 workspace-toolbar no-print" aria-label="Search tracking records" {% include "partials/_auto_filter_attrs.html" %}>
+  {% if resolved.as_office %}<input type="hidden" name="office" value="{{ resolved.as_office.pk }}">{% elif resolved.all_offices %}<input type="hidden" name="office" value="all">{% endif %}
+  {% if resolved.scope %}<input type="hidden" name="scope" value="{{ resolved.scope }}">{% endif %}
+  {% for stage in selected_statuses %}<input type="hidden" name="status" value="{{ stage }}">{% endfor %}
+  {% for office in selected_office_ids %}<input type="hidden" name="offices" value="{{ office }}">{% endfor %}
+  {% if selected_owner %}<input type="hidden" name="owner" value="{{ selected_owner }}">{% endif %}
+  {% if selected_sort %}<input type="hidden" name="sort" value="{{ selected_sort }}">{% endif %}
+  {% if resolved.overdue %}<input type="hidden" name="overdue" value="{{ resolved.overdue }}">{% endif %}
+  <input type="hidden" name="per_page" value="{{ page_size }}">
+  <div class="card-udm-body"><div class="row g-2 align-items-end">
+    <div class="col-sm-9"><label class="form-label" for="{{ form.q.id_for_label }}">Search tracking</label>{{ form.q }}{{ form.q.errors }}</div>
+    <div class="col-sm-3 d-grid"><button class="btn btn-udm" type="submit">Search</button></div>
+  </div></div>
+</form>
+<div class="tracking-queue-nav mb-3" aria-label="Tracking views">
+  <div class="tracking-queue-list">
+    <a class="pill-toggle{% if not resolved.scope and not resolved.statuses %} is-active{% endif %}"
+       href="{{ all_tracking_href }}">All in Tracking</a>
+    {% if resolved.scope or resolved.statuses or resolved.raised_by_ids or selected_owner or request.GET.office or resolved.overdue or query or selected_sort %}
+      <a class="pill-toggle" href="{% url 'tracking:list' %}" data-filter-discard>Clear filters</a>
+    {% endif %}
+  </div>
+</div>
+{% include "partials/_direction_filters.html" with groups=direction_filter_groups prefix="tracking-direction" %}
+{% comment %}
+  The filters are pills too, because they are the same control as the queue nav
+  above: click a thing, narrow the list. The bordered card with checkboxes, a
+  radio group and an Apply button was a second UI language on one page for a job
+  the first language already did.
+
+  Every pill is a link whose href already contains the selection clicking it
+  would produce — see the `filter_url` tag. That is what removes the Apply
+  button even for the multi-select office row: there is no form state to submit,
+  so there is nothing to apply. It also means each pill carries the active queue
+  along, which is what the hidden inputs used to be for.
+{% endcomment %}
+{% if can_pick_office %}
+<div class="tracking-filter-scope mb-3 no-print">
+    {% comment %}
+      "View this page as office X", the control for the `?office=` parameter the
+      page has honoured all along without offering a way to set it. Gated on
+      is_office_admin by services.scope_office, which is also what refuses the
+      parameter itself — the control is a convenience, not the permission.
+
+      Distinct from "Originating office" below, and the labels have to carry
+      that: this one changes whose queues the page answers for, that one filters
+      by who raised the document. Same word, two questions, which is exactly the
+      confusion apps/core/filters.py exists to keep apart.
+
+      The current filters ride along as hidden inputs. A GET form submits only
+      its own fields, so without them picking an office would silently clear the
+      queue and every filter beside it.
+    {% endcomment %}
+    <div class="tracking-filter-row tracking-filter-row--scope">
+      <span class="tracking-filter-label" id="filter-as-office-label">Viewing as</span>
+      <form id="tracking-office-filter" class="dashboard-scope" method="get" action="{% url 'tracking:list' %}" {% include "partials/_auto_filter_attrs.html" with filter_mode="change" %}>
+        {% if resolved.scope %}<input type="hidden" name="scope" value="{{ resolved.scope }}">{% endif %}
+        {% for stage in selected_statuses %}<input type="hidden" name="status" value="{{ stage }}">{% endfor %}
+        {% if request.GET.sort %}<input type="hidden" name="sort" value="{{ request.GET.sort }}">{% endif %}
+        {% if request.GET.q %}<input type="hidden" name="q" value="{{ request.GET.q }}">{% endif %}
+        {% if request.GET.owner %}<input type="hidden" name="owner" value="{{ request.GET.owner }}">{% endif %}
+        {% if resolved.overdue %}<input type="hidden" name="overdue" value="{{ resolved.overdue }}">{% endif %}
+        {% comment %}
+          Carried like every other filter above: a GET form submits only its own
+          fields, so without this a reader who asked for 100 rows is snapped back
+          to 25 the moment they change office.
+        {% endcomment %}
+        <input type="hidden" name="per_page" value="{{ page_size }}">
+        {% for raised in resolved.raised_by_ids %}
+          <input type="hidden" name="offices" value="{{ raised }}">
+        {% endfor %}
+        {% comment %}
+          Refresh the workspace in place and retain the native fallback.
+        {% endcomment %}
+        <select class="form-select form-select-sm" id="tracking-as-office" name="office"
+                aria-labelledby="filter-as-office-label">
+          {% comment %}
+            All offices, then the offices. "Your office" stood here as a third
+            entry and was neither: the reader's own office is in the list below
+            under its own name, so it duplicated one of them while reading like
+            something else — and with "All offices" beside it, two entries
+            claimed to be the default.
+
+            Offered to a system administrator, whose scope is the university.
+            An office administrator's default is their own office, selected
+            below by name, because that is what the page actually answers for
+            and a label promising more than it delivers is what this replaced.
+          {% endcomment %}
+          {% if user.is_system_admin %}
+            <option value="all" {% if resolved.all_offices %}selected{% endif %}>All offices</option>
+          {% endif %}
+          {% for office in filter_offices %}
+            <option value="{{ office.pk }}"
+                    {% if resolved.as_office.pk == office.pk %}selected{% endif %}>
+              {{ office.code }} · {{ office.name }}
+            </option>
+          {% endfor %}
+        </select>
+        <button class="btn btn-udm-outline btn-sm" type="submit" data-filter-fallback>Apply</button>
+      </form>
+    </div>
+    {% if resolved.all_offices %}
+      {% comment %}
+        Said here, beside the control that answers it, rather than leaving the
+        rows silently untagged. Incoming and Outgoing describe a document
+        relative to one office — a record moving MED to SUP is neither, read
+        from the whole university — so across every office there is nothing for
+        the tag to say. From and Receiving office still carry the movement.
+      {% endcomment %}
+      <p class="tracking-filter-note">
+        Incoming and Outgoing are relative to one office, so they are not shown
+        across all of them. Pick an office above to see which way each document
+        is moving for it.
+      </p>
+    {% endif %}
+  </div>
+{% endif %}
+
+<details id="tracking-filter-options" class="tracking-filter-disclosure no-print"{% if selected_office_ids or selected_statuses or resolved.overdue or selected_sort or selected_owner %} open{% endif %}>
+  <summary>
+    <span><strong>More filters</strong><span class="tracking-filter-description">Multiple stages, originating office, deadline, sort, and ownership</span></span>
+    {% if selected_office_ids or selected_statuses or resolved.overdue or selected_sort or selected_owner %}<span class="tracking-filter-applied">Filters applied</span>{% endif %}
+  </summary>
+<div class="tracking-filters">
+  <div class="tracking-filter-row">
+    <span class="tracking-filter-label" id="filter-office-label">Originating office</span>
+    <div class="pill-row">
+      <div class="pill-row-list" role="group" aria-labelledby="filter-office-label">
+        {% for office in filter_offices %}
+          {% with selected=office.pk|stringformat:"s" %}
+            <a class="pill-toggle{% if selected in selected_office_ids %} is-active{% endif %}"
+               href="{% filter_url 'offices' office.pk multi=True %}"
+               title="{{ office.name }}"
+               {% if selected in selected_office_ids %}aria-current="true"{% endif %}>
+              {{ office.code }}
+              <span class="visually-hidden">
+                {% if selected in selected_office_ids %}selected — activate to remove{% else %}activate to add{% endif %}
+              </span>
+            </a>
+          {% endwith %}
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  {% comment %}
+    Stage, as its own row and multi-select. `?status=` was single-valued, so
+    "pending receipt and received" — the two halves of what an office has not
+    finished with — could not be asked at all: you picked one and re-read the
+    page for the other. Repeated values now, like the office row above.
+
+    Selecting none is all of them, so there is no "All statuses" pill: on a
+    multi-select it would be selectable *beside* a stage, which reads as "all of
+    them and this one".
+
+    This additional row can combine several stages in the chosen direction.
+    The main grouped links replace both direction and stage in one selection.
+    Status describes the whole document, not an individual recipient's receipt.
+  {% endcomment %}
+  <div class="tracking-filter-row tracking-filter-row--stage">
+    <span class="tracking-filter-label" id="filter-status-label">Stages in this view (select one or more)</span>
+    <div class="pill-row">
+      <div class="pill-row-list" role="group" aria-labelledby="filter-status-label">
+        {% for value, label in status_choices %}
+          <a class="pill-toggle{% if value in selected_statuses %} is-active{% endif %}"
+             href="{% filter_url 'status' value multi=True %}"
+             {% if value in selected_statuses %}aria-current="true"{% endif %}>
+            {{ label }}
+            <span class="visually-hidden">
+              {% if value in selected_statuses %}selected — activate to remove{% else %}activate to add{% endif %}
+            </span>
+          </a>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  {% comment %}
+    Deadline, as a row of its own. It was a single Overdue pill in the queue
+    nav above, which could say "late" and could not say "on time": `?overdue=no`
+    was resolved and filtered all along and simply had no control, so the one
+    question an office asks in two directions had a button for one of them.
+
+    Three states because an absent parameter has to go on meaning "do not
+    filter" — see apps.core.filters.OVERDUE_VALUES. All deadlines is that
+    absent parameter, so clicking it clears rather than sets.
+
+    Still a modifier and not a queue: it composes with whichever queue is
+    selected, which is why it sits in the filter rows with Status and Show
+    rather than back among the pills it used to live in.
+  {% endcomment %}
+  <div class="tracking-filter-row">
+    <span class="tracking-filter-label" id="filter-deadline-label">Deadline</span>
+    <div class="pill-row">
+      <div class="pill-row-list" role="group" aria-labelledby="filter-deadline-label">
+        <a class="pill-toggle{% if not resolved.overdue %} is-active{% endif %}"
+           href="{% filter_url 'overdue' '' %}"
+           {% if not resolved.overdue %}aria-current="true"{% endif %}>All deadlines</a>
+        <a class="pill-toggle{% if resolved.overdue == 'no' %} is-active{% endif %}"
+           href="{% filter_url 'overdue' 'no' %}"
+           {% if resolved.overdue == 'no' %}aria-current="true"{% endif %}>On time</a>
+        <a class="pill-toggle pill-toggle--alert{% if resolved.overdue == 'yes' %} is-active{% endif %}"
+           href="{% filter_url 'overdue' 'yes' %}"
+           {% if resolved.overdue == 'yes' %}aria-current="true"{% endif %}>Overdue</a>
+      </div>
+    </div>
+  </div>
+
+  {% comment %}
+    Sort, as a row of pills like everything else in this bar. It is not a filter
+    — it narrows nothing — but it is set the same way and read the same way, and
+    a lone dropdown among four pill rows would look like a control that behaves
+    differently because it does something different. It does not.
+
+    "Recently updated" is the empty value, so it is both the default and the way
+    back: `filter_url` clears a parameter when its current value is clicked, and
+    the default pill carries "". No separate reset needed.
+  {% endcomment %}
+  <div class="tracking-filter-row">
+    <span class="tracking-filter-label" id="filter-sort-label">Sort</span>
+    <div class="pill-row">
+      <div class="pill-row-list" role="group" aria-labelledby="filter-sort-label">
+        {% for value, label in sort_choices %}
+          <a class="pill-toggle{% if selected_sort == value %} is-active{% endif %}"
+             href="{% filter_url 'sort' value %}"
+             {% if selected_sort == value %}aria-current="true"{% endif %}>{{ label }}</a>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+
+  <div class="tracking-filter-row">
+    <span class="tracking-filter-label" id="filter-owner-label">Show</span>
+    <div class="pill-row">
+      <div class="pill-row-list" role="group" aria-labelledby="filter-owner-label">
+        {% for value, label in form.owner.field.choices %}
+          <a class="pill-toggle{% if selected_owner == value %} is-active{% endif %}"
+             href="{% filter_url 'owner' value %}"
+             {% if selected_owner == value %}aria-current="true"{% endif %}>{{ label }}</a>
+        {% endfor %}
+      </div>
+    </div>
+  </div>
+</div>
+</details>
+
+{% comment %}
+  Above the table, not under it. The page length and where in the results this
+  page sits are both things the reader wants before working down the rows, and
+  under a full page they are a scroll away.
+{% endcomment %}
+{% pager section="size" %}
+{% comment %}
+  Three offices appear on every row and they are three different facts, so
+  they are defined once, here, above the table that uses them — and each
+  column's heading repeats its own definition on hover. The note under the
+  table defined one of the three, a scroll away from the rows it explained.
+{% endcomment %}
+<dl class="office-terms">
+  <div><dt>Originating office</dt><dd>raised the document. It never changes; it is under each subject.</dd></div>
+  <div><dt>Received by</dt><dd>offices that confirmed receipt of the latest endorsement. More than one office can receive a document.</dd></div>
+  <div><dt>Awaiting receipt</dt><dd>offices that still need to confirm receipt. Once confirmed, they appear under Received by.</dd></div>
+</dl>
+{% if can_bulk_receive %}
+<form method="post" action="{% url 'tracking:bulk_confirm_receipt' %}{% if request.GET %}?{{ request.GET.urlencode }}{% endif %}" novalidate>
+  {% csrf_token %}
+  <input type="hidden" name="next" value="tracking">
+{% endif %}
+<div id="tracking-results" data-filter-region class="card-udm">
+  <div class="card-udm-head">
+    <h2>{{ total }} tracking record{{ total|pluralize }}</h2>
+    <a class="small" href="{% url 'core:report_export' %}?{{ request.GET.urlencode }}&amp;source=tracking">Export CSV</a>
+  </div>
+  <div class="card-udm-body p-0 table-responsive" tabindex="0" role="region" aria-label="Tracking records">
+    <table class="table-udm tracking-records-table">
+      <thead>
+        <tr>
+          {# Current and receiving both: where it is, and who owes the next act. #}
+          {% if can_bulk_receive %}<th scope="col"><span class="visually-hidden">Select for receipt</span></th>{% endif %}<th scope="col">Tracking number</th><th scope="col">Subject</th><th scope="col" title="Offices that confirmed receipt of the latest endorsement.">Received by</th><th scope="col" title="Offices that still need to confirm receipt of the latest endorsement.">Awaiting receipt</th><th scope="col">Updated</th><th scope="col">Status</th><th scope="col"><span class="visually-hidden">Action</span></th>
+        </tr>
+      </thead>
+      <tbody>
+        {% for record in records %}
+          <tr>
+            {% if can_bulk_receive %}<td>{% if record.can_confirm_now %}<input class="form-check-input" type="checkbox" name="record_ids" value="{{ record.pk }}" aria-label="Select {{ record.display_tracking_number }} for receipt">{% endif %}</td>{% endif %}
+            <td class="mono"><a href="{{ record.stage_url|default:record.get_absolute_url }}">{{ record.display_tracking_number }}</a></td>
+            <td class="tracking-subject">
+              {{ record.subject|truncatechars:60 }}
+              <div class="text-muted" style="font-size:12.5px;">
+                {% include "partials/_direction_tag.html" with direction=record.direction %}
+                {{ record.document_type_names|default:"No type" }} ·
+                {% comment %}
+                "Originating office", not "from". Every row here already
+                carries a Current office column, and the two are different
+                offices for any document in transit — so a bare "from SUP"
+                beside "Current office SUP" read as one fact stated twice
+                instead of two facts that happen to agree today.
+
+                It is the same ambiguity the office filter was split to remove:
+                the dropdown it replaced matched originating OR current office,
+                so picking Supply returned both what Supply raised and what was
+                merely passing through it. The row now uses the filter's word
+                and the detail page's word, so all three name the same thing.
+                {% endcomment %}
+                Originating office {% include "partials/_office_badge.html" with office=record.originating_office %}
+              </div>
+            </td>
+            <td class="office-cell" data-receipt-offices="received">{% include "partials/_receipt_offices.html" with kind="received" %}</td>
+            <td class="office-cell" data-receipt-offices="pending">{% include "partials/_receipt_offices.html" with kind="pending" %}</td>
+            <td class="tracking-updated">{{ record.last_movement_at|date:"d M Y" }}<br>{{ record.last_movement_at|date:"g:i A" }}</td>
+          <td>
+              {% comment %}
+                Two pills, because they answer different questions: the stage
+                says what to do next, the tag says how urgent it is. They used
+                to be one, and the stage was the half that lost.
+              {% endcomment %}
+              <div class="pill-stack">
+                {% include "partials/_status_pill.html" with status=record.display_status %}
+                {% include "partials/_overdue_tag.html" with state=record.deadline_state %}
+                {% comment %}
+                  The date itself, under the pills that depend on it. Inline
+                  rather than a ninth column: this table is already seven wide
+                  (eight with the receipt checkbox) and carries a 720px
+                  min-width, so it scrolls sideways on a laptop before anything
+                  is added to it. Under the pills rather than under the subject
+                  because "Overdue" and "Due soon" are claims about this date,
+                  and a reader who doubts one should not have to look across the
+                  row to check it.
+                {% endcomment %}
+                {% if record.due_at %}
+                  <div class="deadline-when-cell">Due {{ record.due_at|date:"d M Y, g:i A" }}</div>
+                {% endif %}
+              </div>
+            </td>
+            <td class="text-end">
+              {% if record.can_confirm_now %}
+                <a class="btn btn-receipt btn-sm" href="{{ record.stage_url|default:record.get_absolute_url }}">
+                      <span class="btn-receipt-icon" aria-hidden="true">✓</span>
+                      <span>Confirm Receipt</span>
+                    </a>
+              {% else %}
+                <a class="btn btn-udm-outline btn-sm" href="{{ record.stage_url|default:record.get_absolute_url }}" aria-label="Open {{ record.display_tracking_number }}">Open</a>
+              {% endif %}
+            </td>
+          </tr>
+        {% empty %}
+          {% comment %}
+            Some combinations are empty by construction rather than empty today
+            — route_record refuses to send an office its own document, so
+            "Incoming" and "Created by me" can never both hold. Saying so beats
+            an empty table the reader reads as a broken filter.
+          {% endcomment %}
+          <tr><td colspan="{% if can_bulk_receive %}8{% else %}7{% endif %}">
+            <div class="empty-state">
+              <h3>No tracking records match this view</h3>
+              {% if impossible_reason %}
+                <p>{{ impossible_reason }}</p>
+              {% else %}
+                <p>Clear the filters or choose another queue above to see more records.</p>
+              {% endif %}
+              <a class="btn btn-udm-outline" href="{% url 'tracking:list' %}" data-filter-discard>Clear filters</a>
+            </div>
+          </td></tr>
+        {% endfor %}
+      </tbody>
+    </table>
+  </div>
+  {% if can_bulk_receive %}
+    <div class="card-udm-body border-top">
+      <label class="form-label" for="bulk-receipt-note">Receipt note for all selected records (optional)</label>
+      <textarea class="form-control" id="bulk-receipt-note" name="note" maxlength="2000" rows="2" placeholder="Add the same custody note to each selected record"></textarea>
+      <div class="form-check mt-3">
+        <input class="form-check-input" type="checkbox" name="confirm_custody" id="bulk-confirm-custody" required>
+        <label class="form-check-label" for="bulk-confirm-custody">I confirm the selected physical or digital documents are present in my office's custody.</label>
+      </div>
+      <button class="btn btn-receipt mt-3" type="submit">Confirm Receipt for Selected</button>
+    </div>
+  {% endif %}
+</div>
+{% if can_bulk_receive %}</form>{% endif %}
+{% pager section="steps" %}
+
+{% endblock %}

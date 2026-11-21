@@ -1,0 +1,94 @@
+{% extends "base.html" %}
+{% load doctrack %}
+{% block title %}Users · {{ SITE_NAME }}{% endblock %}
+{% block content %}
+<div class="workspace-page workspace-admin workspace-list">
+<div class="page-head">
+  <div><div class="eyebrow">Administration</div><h1>User and office administration</h1>
+  <p class="sub">Every account gets an office and a role before its first sign-in.</p></div>
+  <a class="btn btn-udm" href="{% url 'accounts:user_create' %}">+ Add user</a>
+</div>
+{% include "administration/_tabs.html" with tab='users' %}
+
+<div class="card-udm mb-3 workspace-toolbar"><div class="card-udm-body">
+  {% comment %}
+    Search submits the pending office, role, status and typed words together,
+    preserving the selected page size.
+  {% endcomment %}
+  <form id="user-filters" method="get" class="row g-2 align-items-end admin-filters" {% include "partials/_auto_filter_attrs.html" %}>
+    {# Carried so filtering does not snap a reader who asked for 100 rows back to 25. #}
+    <input type="hidden" name="per_page" value="{{ page_size }}">
+    <div class="col-md-4">
+      <label class="form-label" for="user-q">Search</label>
+      <input class="form-control" id="user-q" name="q" value="{{ query }}" placeholder="Name, username or email">
+    </div>
+    {% if not is_office_scoped %}
+      <div class="col-md-3">
+        <label class="form-label" for="user-office">Office</label>
+        <select class="form-select" id="user-office" name="office">
+          <option value="">All offices</option>
+          {% for office in offices %}
+            <option value="{{ office.pk }}" {% if selected_office == office.pk|stringformat:"s" %}selected{% endif %}>{{ office.name }}</option>
+          {% endfor %}
+        </select>
+      </div>
+    {% endif %}
+    <div class="col-6 col-md-2">
+      <label class="form-label" for="user-role">Role</label>
+      <select class="form-select" id="user-role" name="role">
+        <option value="">Any role</option>
+        {% for value, label in roles %}
+          <option value="{{ value }}" {% if selected_role == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-6 col-md-2">
+      <label class="form-label" for="user-status">Status</label>
+      <select class="form-select" id="user-status" name="status">
+        <option value="">Any status</option>
+        {% for value, label in statuses %}
+          <option value="{{ value }}" {% if selected_status == value %}selected{% endif %}>{{ label }}</option>
+        {% endfor %}
+      </select>
+    </div>
+    <div class="col-md-1 d-grid"><button class="btn btn-udm-outline" type="submit">Search</button></div>
+  </form>
+  <div class="admin-filter-summary">
+    {{ page_obj.paginator.count }} account{{ page_obj.paginator.count|pluralize }}{% if is_office_scoped %} in {{ user.office_label }}{% endif %}
+    {% if is_filtered %}· <a href="{% url 'accounts:user_list' %}" data-filter-discard>Clear filters</a>{% endif %}
+  </div>
+</div></div>
+
+{% comment %}
+  Above the list. The page length and where in the results this page sits are
+  both wanted before working down the rows, and under a full page they are a
+  scroll away.
+{% endcomment %}
+{% pager section="size" %}
+<div id="user-results" data-filter-region class="card-udm"><div class="card-udm-body p-0 table-responsive">
+  <table class="table-udm">
+    <thead><tr><th>User</th><th>Office</th><th>Role</th><th>Status</th><th></th></tr></thead>
+    <tbody>
+      {% for row in users %}
+        <tr>
+          <td><strong>{{ row.display_name }}</strong><div class="text-muted" style="font-size:12.5px;">{{ row.username }}{% if row.email %} · {{ row.email }}{% endif %}</div></td>
+          <td>{% include "partials/_office_badge.html" with office=row.office %}</td>
+          <td>{{ row.get_role_display }}</td>
+          <td>
+            {% if row.is_active %}<span class="pill pill-ok">Active</span>
+            {% else %}<span class="pill pill-overdue">Suspended</span>{% endif %}
+          </td>
+          <td class="text-end">
+            <a class="btn btn-udm-outline btn-sm" href="{% url 'accounts:user_edit' row.pk %}" aria-label="Edit user {{ row.display_name }} ({{ row.username }})">Edit</a>
+            <form method="post" action="{% url 'accounts:user_toggle' row.pk %}" class="d-inline">{% csrf_token %}
+              <button class="btn btn-link btn-sm" aria-label="{% if row.is_active %}Suspend{% else %}Reactivate{% endif %} user {{ row.display_name }} ({{ row.username }})">{% if row.is_active %}Suspend{% else %}Reactivate{% endif %}</button>
+            </form>
+          </td>
+        </tr>
+      {% empty %}<tr><td colspan="5" class="p-4 text-muted">No accounts match this filter.</td></tr>{% endfor %}
+    </tbody>
+  </table>
+</div></div>
+{% pager section="steps" %}
+</div>
+{% endblock %}

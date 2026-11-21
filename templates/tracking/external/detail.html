@@ -1,0 +1,162 @@
+{% extends "tracking/external/base.html" %}
+{% block title %}{{ record.display_tracking_number }} · {{ SITE_NAME }}{% endblock %}
+{% block external_content %}
+<div class="workspace-detail-page tracking-detail-page">
+  <div class="page-head">
+    <div>
+      <div class="eyebrow">External Tracking Record</div>
+      <h1>{{ record.title }}</h1>
+      <p class="sub">
+        <span class="mono">{{ record.display_tracking_number }}</span>
+        {% include 'partials/_status_pill.html' with status=record.status %}
+      </p>
+    </div>
+    <div class="page-actions no-print">
+      {% if can_receipt or can_act or can_manage %}<a class="btn btn-udm-outline d-lg-none" href="#tracking-record-actions">Go to document actions</a>{% endif %}
+      {% if record.status != 'DRAFT' %}<a class="btn btn-udm-outline" href="{% url 'tracking:external_slip' record.pk %}{{ external_query }}">Print routing slip</a>{% endif %}
+      <a class="btn btn-udm-outline" href="{% url 'tracking:external_list' %}{{ external_query }}">Back to External Tracking</a>
+    </div>
+  </div>
+
+  <div class="row g-4 tracking-detail-layout">
+    <div class="col-lg-4 tracking-record-context">
+      <section class="card-udm">
+        <div class="card-udm-head"><h2>Paper and custody</h2></div>
+        <div class="card-udm-body">
+          <table class="table table-sm table-stacked mb-0">
+            <caption class="visually-hidden">External paper and current custody</caption>
+            <tbody>
+              <tr><th scope="row" class="text-muted fw-normal">Original paper reference</th><td>{{ record.original_reference|default:'Not supplied' }}</td></tr>
+              <tr><th scope="row" class="text-muted fw-normal">Document types</th><td>{{ record.document_type_names|default:'Not specified' }}</td></tr>
+              <tr><th scope="row" class="text-muted fw-normal">Confirmed custodian</th><td>{{ record.current_office_snapshot }}<div class="small text-muted">{% if record.current_external_office_id %}External UDM office{% else %}Internal DocTrack office{% endif %}</div></td></tr>
+              <tr><th scope="row" class="text-muted fw-normal">Pending recipient</th><td>{% with step=record.current_step %}{% if step and not step.received_at %}{{ step.to_name_snapshot }}<div class="small text-muted">{% if step.to_external_office_id %}External receipt to be recorded manually{% else %}Internal office must confirm receipt{% endif %}</div>{% else %}None{% endif %}{% endwith %}</td></tr>
+              <tr><th scope="row" class="text-muted fw-normal">Deadline</th><td>{{ record.due_at|date:'d M Y, g:i A'|default:'None' }}</td></tr>
+              <tr><th scope="row" class="text-muted fw-normal">Revision</th><td>{{ record.revision }}</td></tr>
+            </tbody>
+          </table>
+          {% if record.description %}<p class="external-preserve mt-3 mb-0">{{ record.description }}</p>{% endif %}
+        </div>
+      </section>
+
+      <section class="card-udm mt-4 tracking-record-files">
+        <div class="card-udm-head"><h2>Supporting attachments</h2></div>
+        <div class="card-udm-body">
+          {% include "partials/_file_versions.html" %}
+        </div>
+      </section>
+    </div>
+
+    <div class="col-lg-8 tracking-record-work">
+      <div class="tracking-record-actions no-print" id="tracking-record-actions" tabindex="-1">
+        <section class="card-udm">
+          <div class="card-udm-head"><h2>Document actions</h2></div>
+          <div class="card-udm-body">
+            {% if can_receipt %}
+              <div class="mb-3">
+                <p class="text-muted body-copy">Confirm that your internal office has received this paper. The server records the receipt date and time.</p>
+                {% if access.external_tracking.receive %}<a class="btn btn-udm" href="{% url 'tracking:external_action' record.pk 'receipt' %}{{ external_query }}">Confirm receipt for your office</a>{% endif %}
+              </div>
+            {% endif %}
+            {% if record.status == 'DRAFT' and can_manage and access.external_tracking.endorse %}
+              <div class="mb-3">
+                <p class="text-muted body-copy">This record is still a draft. Review its details before sending the paper to its first recipient.</p>
+                <a class="btn btn-udm" href="{% url 'tracking:external_review' record.pk %}{{ external_query }}">Review and send draft</a>
+              </div>
+            {% endif %}
+            {% if can_manage %}
+              {% with step=record.current_step %}
+                {% if step.to_external_office_id and not step.received_at %}
+                  <div class="mb-3">
+                    <p class="text-muted body-copy">Record the actual receipt date and time reported by {{ step.to_name_snapshot }}. External office updates are entered manually by the managing administrator.</p>
+                    {% if access.external_tracking.receive %}<a class="btn btn-udm" href="{% url 'tracking:external_action' record.pk 'external-receipt' %}{{ external_query }}">Record external receipt</a>{% endif %}
+                  </div>
+                {% endif %}
+              {% endwith %}
+              {% if record.status == 'COMPLETED_PENDING_UPLOAD' %}
+                <div class="mb-3">
+                  <p class="text-muted body-copy">The work is completed and waiting for filing approval.</p>
+                  <div class="d-flex flex-wrap gap-2">
+                    {% if access.external_tracking.file %}<a class="btn btn-udm" href="{% url 'tracking:external_action' record.pk 'file' %}{{ external_query }}">Approve filing</a>{% endif %}
+                    {% if access.external_tracking.reopen %}<a class="btn btn-udm-outline" href="{% url 'tracking:external_action' record.pk 'reopen' %}{{ external_query }}">Reopen work</a>{% endif %}
+                  </div>
+                </div>
+              {% endif %}
+            {% endif %}
+
+            {% if can_act and record.status != 'COMPLETED' and record.status != 'COMPLETED_PENDING_UPLOAD' %}
+              <h3 class="section-heading">Act on this document</h3>
+              <div class="d-flex flex-wrap gap-2 mb-3">
+                {% if record.status != 'DRAFT' %}{% if access.external_tracking.endorse %}<a class="btn btn-udm-outline" href="{% url 'tracking:external_action' record.pk 'route' %}{{ external_query }}">Forward or return</a>{% endif %}{% endif %}
+                {% if access.external_tracking.work %}<a class="btn btn-udm-outline" href="{% url 'tracking:external_action' record.pk 'remark' %}{{ external_query }}">Add remark</a>{% endif %}
+                {% if access.external_tracking.edit_files %}<a class="btn btn-udm-outline" href="{% url 'tracking:external_action' record.pk 'attachment' %}{{ external_query }}">Attach file</a>{% endif %}
+                {% if record.status != 'DRAFT' %}{% if access.external_tracking.complete %}<a class="btn btn-udm-outline" href="{% url 'tracking:external_action' record.pk 'complete' %}{{ external_query }}">Complete work</a>{% endif %}{% endif %}
+                {% if can_manage and record.current_external_office_id and record.status != 'DRAFT' %}{% if access.external_tracking.work %}<a class="btn btn-udm-outline" href="{% url 'tracking:external_action' record.pk 'external-work' %}{{ external_query }}">Record external work</a>{% endif %}{% endif %}
+              </div>
+            {% endif %}
+            {% if can_manage %}
+              <h3 class="section-heading">Historical notes</h3>
+              {% if access.external_tracking.work %}<a class="btn btn-udm-outline" href="{% url 'tracking:external_action' record.pk 'annotation' %}{{ external_query }}">Add historical annotation</a>{% endif %}
+            {% endif %}
+            {% if user.is_viewer %}<p class="text-muted mb-0">Your account has read-only access.</p>{% endif %}
+            {% if is_filed %}<p class="text-muted mt-3 mb-0">Filed custody history is frozen. Administrators can add historical annotations.</p>{% endif %}
+          </div>
+        </section>
+      </div>
+
+      <section class="card-udm mt-4 tracking-record-history">
+        <div class="card-udm-head"><h2>Custody history</h2></div>
+        <p class="timeline-basis">External office updates are entered manually by the managing administrator. Internal offices confirm receipt using server time.</p>
+        <div class="card-udm-body">
+          <ol class="timeline">
+            {% for step in steps %}
+              {% include 'tracking/external/_timeline_step.html' %}
+            {% empty %}
+              <li class="is-muted"><div class="t-title">Draft created</div><div class="t-meta">The draft has no routing movements yet.</div></li>
+            {% endfor %}
+          </ol>
+
+          <hr>
+          <h3 class="section-heading">Activity and annotations</h3>
+          <ol class="timeline">
+            {% for activity in activities %}
+              {% include 'tracking/external/_timeline_activity.html' %}
+            {% empty %}
+              <li class="is-muted"><div class="t-meta">No activity recorded.</div></li>
+            {% endfor %}
+          </ol>
+        </div>
+      </section>
+
+      <section class="card-udm mt-4">
+        <div class="card-udm-head"><h2>Correction audit trail</h2></div>
+        <div class="card-udm-body">
+          {% if corrections %}
+            <details class="fold mb-0" open>
+              <summary class="disclosure-control">
+                <span class="disclosure-copy"><span class="disclosure-title">{{ corrections|length }} correction{{ corrections|length|pluralize }}</span><span class="disclosure-description">Review reasons, original values, replacement values, and the people who recorded changes.</span></span>
+                {% include 'core/_disclosure_state.html' %}
+              </summary>
+              {% for correction in corrections %}
+                <article class="external-correction">
+                  <h3 class="h6">Revision {{ correction.revision }} · Movement {{ correction.step.sequence }}</h3>
+                  <p class="external-preserve">{{ correction.reason }}</p>
+                  <table class="table table-sm table-stacked">
+                    <caption class="visually-hidden">Values for correction revision {{ correction.revision }}</caption>
+                    <tbody>
+                      <tr><th scope="row" class="text-muted fw-normal">Original values</th><td>{% for field,value in correction.old_values.items %}<div class="external-preserve"><strong>{{ field }}:</strong> {{ value }}</div>{% endfor %}</td></tr>
+                      <tr><th scope="row" class="text-muted fw-normal">Replacement values</th><td>{% for field,value in correction.new_values.items %}<div class="external-preserve"><strong>{{ field }}:</strong> {{ value }}</div>{% endfor %}</td></tr>
+                    </tbody>
+                  </table>
+                  <p class="small text-muted mb-0">{{ correction.actor_name_snapshot }} · {{ correction.actor_office_snapshot }} · Recorded {{ correction.recorded_at|date:'d M Y, g:i A' }}</p>
+                </article>
+              {% endfor %}
+            </details>
+          {% else %}
+            <p class="text-muted mb-0">No corrections.</p>
+          {% endif %}
+        </div>
+      </section>
+    </div>
+  </div>
+</div>
+{% endblock %}

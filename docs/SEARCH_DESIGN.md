@@ -1,0 +1,188 @@
+# Search design
+
+The archive will hold thousands of documents. Search is what makes that useful instead of a landfill. This document explains exactly how a result gets its percentage — because a number nobody can explain is a number nobody should trust.
+
+## Workspace filters
+
+Tracking and Search's Tracking mode share the same tracking-number, subject and office query, queue filters, ownership filters and sort order. Tracking CSV exports use that same population and ordering. Relevance does not apply to tracking records.
+
+The Repository adds Search's document-date range and relevance controls to its existing office, type, year/month, tag, origin and deletion-review filters. Both pages validate dates and thresholds through the same form controls and calculate scores through `search_documents`. Office choices and every result remain bounded by `Document.objects.visible_to(user)`.
+
+Entering search text orders Repository documents by relevance and applies the selected minimum. Repository starts at zero to preserve existing title/text searches; Search keeps its configured default. Explicit thresholds and scores mean the same thing on both screens. “Include results below the threshold” keeps weaker matches visible. With no search text, browsing remains fully paginated and no relevance score is shown. Pending filing keeps subject/number, originating office, type and completion year/month filters; document-date and relevance controls are only for filed documents.
+
+Search continues to return its configured top-result set and explains any limit. The Repository evaluates all matching documents in batches, then paginates the complete qualifying set. Its type/tag/deletion-review counts use the same scored document IDs and existing metadata filters, so results after a page or a search limit are not omitted from those counts.
+
+---
+
+## The one terminology rule
+
+**It is called *relevance*, never *accuracy*.**
+
+- **Relevance** = how well this record matches the words you typed.
+- **Accuracy** = whether the system is correct. That is a different claim, and this number does not make it.
+
+An 82% result means "this record matches your query strongly", not "the system is 82% sure". Anyone reading `apps/search/services.py` will find the same wording. Expect this question at the defence.
+
+---
+
+## Why PostgreSQL and not Elasticsearch
+
+Elasticsearch is excellent and unnecessary here. It means another service to install, secure, back up and pay for. PostgreSQL's full-text search handles hundreds of thousands of documents comfortably, and this archive will be far smaller. Fewer moving parts means fewer things that break the week before a defence.
+
+---
+
+## Step 1 — Documents are indexed into four weighted fields
+
+When a document is saved, its text is split across four buckets. PostgreSQL assigns each a weight (A is strongest).
+
+| Bucket | Weight | Multiplier | What goes in it |
+|---|---|---|---|
+| `index_title` | **A** | 1.00 | Title, reference number, tracking number |
+| `index_meta` | **B** | 0.60 | Office name and code, document type, tags, author, recipient |
+| `index_extra` | **C** | 0.25 | Description, searchable custom metadata fields |
+| `ocr_text` | **D** | 0.10 | The bounded legacy aggregate of extracted text |
+
+A hit in the title counts ten times more than a hit buried in body text. That single decision does most of the work of making results feel sensible.
+
+The four fields are combined into a `SearchVectorField` with a GIN index, so matching stays fast as the archive grows.
+
+With `ENABLE_SOURCE_CHUNK_SEARCH=True`, current source units also have overlapping 4,000-character chunks (512-character overlap). A document's best matching chunk competes with its metadata rank before the document candidate limit. Chunks do not count as extra documents. Old file versions, unpublished runs, inactive records and chunks whose text no longer matches the unit are excluded. Full current supported source text can therefore match beyond the legacy aggregate limit. Snippets name the matching source file and location.
+
+---
+
+## Step 2 — Three scores per result
+
+### Text score (weight 0.55)
+
+PostgreSQL's `ts_rank_cd` compares the query against the weighted vector. Its output is unbounded, so it is squashed into 0–1:
+
+```
+text = rank / (rank + k)        where k = 0.06
+```
+
+This is a saturation curve. A document mentioning your term twenty times is better than one mentioning it twice, but not ten times better — and no single document can run away with the ranking.
+
+### Fuzzy score (weight 0.20)
+
+`pg_trgm` trigram similarity between the query and the title. This is what makes `memorandom` find `memorandum` and `Penafrancia` find `Peñafrancia`.
+
+If the extension is not installed, this term is skipped and the other two are used. Search degrades; it does not break.
+
+### Field score (weight 0.25)
+
+Deterministic bonuses for matching in places that matter, checked in Python:
+
+| Matched where | Bonus |
+|---|---|
+| Exact reference or tracking number | 1.00 (short-circuits to 100%) |
+| Title contains every query token | 0.55 |
+| Title contains at least one token (instead of the preceding bonus) | 0.30 |
+| Reference number contains a token | 0.25 |
+| Tags contain tokens | 0.12 per token, at most 0.25 |
+| Office code equals a token, or the query contains its full name | 0.15 |
+| Document type contains a token | 0.10 |
+| Searchable metadata contains a token | 0.08 |
+| Document text contains a token | 0.05 |
+
+Bonuses add up, capped at 1.0. Source-chunk evidence gives the text bonus once. An expanded-only chunk does not receive the original-query field bonus.
+
+This score does double duty: it feeds the ranking **and** produces the "Matched in: Title, Tags" line under each result. Users trust a search engine that shows its reasoning.
+
+---
+
+## Step 3 — The formula
+
+```
+relevance % = 100 × (0.55 × text + 0.20 × fuzzy + 0.25 × field)
+```
+
+Weights live in `.env` so they can be tuned without touching code:
+
+```
+SEARCH_WEIGHT_TEXT=0.55
+SEARCH_WEIGHT_FUZZY=0.20
+SEARCH_WEIGHT_FIELD=0.25
+SEARCH_RANK_SATURATION_K=0.06
+```
+
+They must sum to 1.0.
+
+**Worked example.** Searching `preventive maintenance` against *"Preventive maintenance of campus equipment"* (tagged `maintenance`, MED — Maintenance and Engineering Division):
+
+```
+text  = 0.34 / (0.34 + 0.06) = 0.85    →  0.55 × 0.85 = 0.4675
+fuzzy = 0.62                            →  0.20 × 0.62 = 0.1240
+field = 0.72 (all title tokens, one tag token, body token) → 0.25 × 0.72 = 0.1800
+                                                        --------
+                                                          0.7715
+
+relevance = 77
+```
+
+---
+
+## Step 4 — The 75% threshold
+
+Results below `SEARCH_MIN_RELEVANCE_DEFAULT` (75) are hidden, and the count of what was hidden is shown:
+
+> *12 more records matched below the 75% threshold.*
+
+Three reasons this design is right:
+
+1. **Nothing is silently dropped.** The user always knows more exists.
+2. **It is adjustable.** A slider on the search page moves it from 0 to 100.
+3. **It is a display filter, not a truth claim.** The system does not assert that a 74% match is wrong — only that it is probably not what you wanted first.
+
+The original flowchart proposed showing 75–100%. This implements that, without pretending the number below the line is meaningless.
+
+---
+
+## Step 5 — Permissions are applied first
+
+Filtering happens **before** ranking, not after. A user can never see a relevance score for a document they are not allowed to open. Ranking a document you cannot read would leak its existence, its title and its office through the result count.
+
+---
+
+## What gets logged
+
+Every search writes to `SearchQueryLog`: the query, filters, result count, duration and user. This exists for one reason — **queries that return nothing are a to-do list**. If ten people search "clearance form" and find nothing, either it was never filed or it was filed under wording nobody would guess. The Reports page surfaces the most common searches.
+
+---
+
+## Tuning it
+
+Symptoms and fixes:
+
+| Symptom | Try |
+|---|---|
+| Right document ranks too low | Raise `SEARCH_WEIGHT_FIELD` and check the title is descriptive |
+| Too many weak matches | Raise the threshold above 75 |
+| Misspellings never match | Run `manage.py init_db` to install `pg_trgm` |
+| Everything scores about the same | Lower `SEARCH_RANK_SATURATION_K` to spread scores out |
+| Recent documents rank too low | Add a recency term (deliberately not built — argue for it first) |
+
+After changing any weight: `make reindex`.
+
+---
+
+## Deliberately not built
+
+Approved query aliases are optional (`ENABLE_APPROVED_SEARCH_ALIASES=False` by default). Only explicitly approved global vocabulary expands a query, with at most eight variants. Original references retain exact-match priority and a score of 100. Expanded text uses half the original text weight; fuzzy and field signals still use the original query. Results identify approved-alias evidence, including its source file when available. The Search default threshold remains 75; Repository defaults to 0, so an alias-only match can be hidden in Search until the user lowers the threshold.
+
+`evaluate_search <private-json-file> --actor <system-admin-id> --collection OVPA` measures supplied, authorized judgments. It reports candidate recall separately from visible precision, success and nDCG at five, the evaluated corpus/window, and two latency passes with uncontrolled caches. Authored fixtures verify mechanics, including Filipino and Taglish phrases; they do not establish real-world retrieval or OCR accuracy. Scoring versions with expansion are `lexical-aliases-1` and `lexical-chunks-aliases-1`.
+
+- **Semantic / vector search** — a real improvement, but it needs embeddings, a vector extension, and an explanation of why a document with none of your words is the top result. Rules and text ranking are explainable today.
+- **Recency boost** — sounds obvious, but a five-year-old policy is often exactly what you want. Needs real usage data first.
+- **Personalised ranking** — makes results unpredictable and unauditable. Wrong for a records system.
+
+---
+
+## Where the code lives
+
+| Thing | Location |
+|---|---|
+| Ranking implementation | `apps/search/services.py` |
+| Index construction | `apps/documents/models.py` → `build_index_blobs()` |
+| Weights and threshold | `config/settings.py`, overridable in `.env` |
+| Search page | `templates/search/search.html` |
+| Tests | `tests/test_search.py` |

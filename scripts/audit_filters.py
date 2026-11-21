@@ -1,0 +1,203 @@
+"""Read-only checks of filter choices, query results, and GET form preservation.
+
+Uses the current local database. Sessions and request logs are rolled back.
+Run from the repository root with the project's Python environment.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import sys
+from html.parser import HTMLParser
+from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parents[1]))
+os.environ.setdefault("DJANGO_SETTINGS_MODULE", "config.settings")
+
+import django  # noqa: E402
+
+django.setup()
+
+from django.db import transaction  # noqa: E402
+from django.test import Client, override_settings  # noqa: E402
+from django.test.utils import setup_test_environment  # noqa: E402
+from django.utils import timezone  # noqa: E402
+
+from apps.accounts.models import Office, User  # noqa: E402
+from apps.core.document_types import document_type_match  # noqa: E402
+from apps.core.models import Tag  # noqa: E402
+from apps.documents.models import Document  # noqa: E402
+from apps.tracking.models import Status, TrackingRecord  # noqa: E402
+from apps.tracking.services import pending_upload_for  # noqa: E402
+from scripts.audit_auth import diagnostic_login  # noqa: E402
+
+
+class Forms(HTMLParser):
+    def __init__(self, text):
+        super().__init__()
+        self.forms = []
+        self.current = None
+        self.feed(text)
+
+    def handle_starttag(self, tag, attributes):
+        attrs = dict(attributes)
+        if tag == "form":
+            self.current = {"attrs": attrs, "hidden": {}}
+            self.forms.append(self.current)
+        elif tag == "input" and self.current and attrs.get("type") == "hidden" and "disabled" not in attrs:
+            self.current["hidden"].setdefault(attrs.get("name"), []).append(attrs.get("value", ""))
+
+    def handle_endtag(self, tag):
+        if tag == "form":
+            self.current = None
+
+
+class FilterAudit:
+    def __init__(self):
+        self.checked = 0
+        self.failures = []
+        self.roles = []
+
+    def equal(self, label, actual, expected):
+        self.checked += 1
+        if actual != expected:
+            self.failures.append({"role": self.user.role, "check": label, "actual": str(actual), "expected": str(expected)})
+
+    def get(self, path, params=None):
+        response = self.client.get(path, params or {}, secure=True)
+        self.equal("page responds: " + path, response.status_code, 200)
+        return response
+
+    def listed_ids(self, path, params, *, response=None):
+        """Visit every real page: Show All still has a bounded page size."""
+        response = self.get(path, params) if response is None else response
+        page = response.context["page_obj"]
+        ids = {row.pk for row in page}
+        for number in range(1, page.paginator.num_pages + 1):
+            if number != page.number:
+                following = self.get(path, {**params, "page": number})
+                ids.update(row.pk for row in following.context["page_obj"])
+        return ids
+
+    def run(self):
+        for role in User.Role.values:
+            self.user = User.objects.filter(role=role, is_active=True, office__isnull=False).order_by("pk").first()
+            if not self.user:
+                continue
+            self.roles.append(role)
+            self.client = Client()
+            diagnostic_login(self.client, self.user)
+            visible = Document.objects.visible_to(self.user).in_collection().filter(is_active=True)
+            tracking = TrackingRecord.objects.visible_to(self.user)
+            self.repository(visible)
+            self.search(visible)
+            self.form_preservation()
+            for bad in ("unknown", "²", "9" * 65):
+                for path in ("/", "/tracking/", "/tracking/reports/", "/documents/reports/", "/documents/"):
+                    self.get(path, {"office": bad, "offices": bad, "trend_year": bad, "status": bad,
+                                    "record_month": bad, "record_type": bad, "year": bad, "month": bad,
+                                    "document_type": bad, "tag": bad, "source": bad, "retention": bad,
+                                    "owner": bad, "sort": bad, "scope": bad, "overdue": bad,
+                                    "turnaround_stage": bad, "per_page": bad, "page": bad})
+            for path in ("/tracking/reports/", "/documents/reports/"):
+                for month in ("0001-01", "9999-12", "2026-1"):
+                    response = self.get(path, {"record_month": month})
+                    self.equal("obsolete report month does not change current totals", response.context["total_documents"], visible.count())
+            for path, data in (
+                ("/tracking/", {"status": [Status.PENDING_RECEIPT, Status.IN_PROCESS], "per_page": "all"}),
+                ("/search/", {"mode": "tracking", "status": [Status.PENDING_RECEIPT, Status.IN_PROCESS], "per_page": "all"}),
+            ):
+                response = self.get(path, data)
+                key = "results" if path == "/search/" else "records" if path == "/tracking/" else "page_obj"
+                rows = response.context[key]
+                self.equal("tracking results stay within permitted rows", {row.pk for row in rows}.issubset(set(tracking.values_list("pk", flat=True))), True)
+            if self.user.is_office_admin:
+                self.administration()
+            print(f"Checked filter validity for {role}", flush=True)
+
+    def repository(self, visible):
+        for office in [None, *Office.objects.filter(documents__in=visible).distinct()]:
+            params = {"office": office.pk} if office else {}
+            base = visible.filter(office=office) if office else visible
+            response = self.get("/documents/", {**params, "per_page": "all"})
+            self.equal("folder result IDs", self.listed_ids("/documents/", {**params, "per_page": "all"}, response=response), set(base.values_list("pk", flat=True)))
+            form = response.context["form"]
+            type_ids = set(base.exclude(document_type=None).values_list("document_type_id", flat=True)) | set(base.exclude(document_types=None).values_list("document_types__pk", flat=True))
+            self.equal("type choices match accessible folder", set(form.fields["document_type"].queryset.values_list("pk", flat=True)), type_ids)
+            self.equal("tag choices match accessible folder", set(form.fields["tag"].queryset.values_list("pk", flat=True)), set(Tag.active.filter(documents__in=base).values_list("pk", flat=True)))
+            for field, model_field in (("document_type", "document_type_id"), ("year", "year"), ("month", "document_date__month"), ("tag", "tags__pk"), ("source", "source")):
+                value = (Tag.active.filter(documents__in=base).values_list("pk", flat=True).first()
+                         if field == "tag" else base.exclude(**{model_field: None}).values_list(model_field, flat=True).first())
+                if value:
+                    selected = {**params, field: value, "per_page": "all"}
+                    result = self.get("/documents/", selected)
+                    expected = base.filter(document_type_match(value)) if field == "document_type" else base.filter(**{model_field: value})
+                    self.equal("repository filter " + field, self.listed_ids("/documents/", selected, response=result), set(expected.values_list("pk", flat=True)))
+        pending = pending_upload_for(self.user)
+        if self.user.is_office_admin and not self.user.is_system_admin:
+            pending = pending.filter(originating_office_id=self.user.office_id)
+        pending_params = {"view": "pending", "retention": "due", "source": "DTS", "per_page": "all"}
+        result = self.get("/documents/", pending_params)
+        self.equal("unsupported filed filters do not claim to filter pending uploads", result.context["selected_filters"], [])
+        self.equal("pending queue permission scope", self.listed_ids("/documents/", pending_params, response=result), set(pending.values_list("pk", flat=True)))
+        other = Office.active.exclude(pk__in=set(visible.values_list("office_id", flat=True)) | set(pending.values_list("originating_office_id", flat=True))).first()
+        if other:
+            denied = self.get("/documents/", {"office": other.pk})
+            expected = visible.filter(office_id=self.user.office_id).count() if self.user.is_office_admin and not self.user.is_system_admin else 0
+            self.equal("unavailable folder respects office boundary", denied.context["total"], expected)
+
+    def search(self, visible):
+        response = self.get("/search/")
+        form = response.context["form"]
+        self.equal("search offices are permission scoped", set(form.fields["office"].queryset.values_list("pk", flat=True)), set(Office.objects.filter(documents__in=visible).values_list("pk", flat=True)))
+        type_ids = set(visible.exclude(document_type=None).values_list("document_type_id", flat=True)) | set(visible.exclude(document_types=None).values_list("document_types__pk", flat=True))
+        self.equal("search includes all types used by visible records", set(form.fields["document_type"].queryset.values_list("pk", flat=True)), type_ids)
+        for data in ({"office": "²"}, {"document_type": "9" * 65}, {"year": "²"}, {"date_from": "2026-10-20", "date_to": "2026-10-01"}):
+            response = self.get("/search/", data)
+            self.equal("invalid search displays form errors", bool(response.context["form"].errors), True)
+
+    def form_preservation(self):
+        year = str(timezone.localdate().year)
+        params = {"office": self.user.office_id, "trend_year": year, "record_q": "memo", "record_status": Status.PENDING_RECEIPT, "per_page": "50"}
+        response = self.get("/tracking/reports/", params)
+        forms = Forms(response.content.decode()).forms
+        year_form = next(form for form in forms if "report-year-picker" in form["attrs"].get("class", ""))
+        for name in ("office", "record_q", "record_status", "per_page"):
+            self.equal("year picker retains " + name, year_form["hidden"].get(name), [str(params[name])])
+        self.equal("year picker does not duplicate controlled value", "trend_year" in year_form["hidden"], False)
+        if self.user.is_system_admin:
+            params = {"status": [Status.PENDING_RECEIPT, Status.IN_PROCESS], "sort": "due_asc", "per_page": "50"}
+            response = self.get("/tracking/", params)
+            form = next(form for form in Forms(response.content.decode()).forms if "dashboard-scope" in form["attrs"].get("class", ""))
+            self.equal("office picker retains every selected status", sorted(form["hidden"].get("status", [])), sorted(params["status"]))
+            self.equal("office picker retains sort", form["hidden"].get("sort"), [params["sort"]])
+
+    def administration(self):
+        for bad in ("²", "9" * 65, "999999"):
+            self.get("/accounts/users/", {"office": bad, "role": bad, "status": bad, "q": "admin"})
+            self.get("/administration/audit-log/", {"office": bad, "action": bad, "event": bad, "since": bad, "until": bad, "access_since": bad, "access_until": bad})
+        if self.user.is_system_admin:
+            for slug in ("document-types", "tags", "metadata-rules", "metadata-fields"):
+                self.get(f"/administration/{slug}/", {"status": "unknown", "q": "a", "page": "²"})
+        for data in ({"kind": "unknown", "filter": "unknown"}, {"kind": "ROUTED", "filter": "unread"}):
+            self.get("/notifications/", data)
+
+
+def main():
+    setup_test_environment()
+    audit = FilterAudit()
+    with override_settings(ALLOWED_HOSTS=["testserver"], SECURE_SSL_REDIRECT=False), transaction.atomic():
+        try:
+            audit.run()
+        finally:
+            transaction.set_rollback(True)
+    result = {"checks": audit.checked, "roles": audit.roles, "failures": audit.failures}
+    print(json.dumps(result, indent=2))
+    if len(sys.argv) > 1:
+        Path(sys.argv[1]).write_text(json.dumps(result, indent=2), encoding="utf-8")
+    return bool(audit.failures)
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

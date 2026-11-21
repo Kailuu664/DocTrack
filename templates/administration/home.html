@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+{% load doctrack %}
+{% block title %}Administration · {{ SITE_NAME }}{% endblock %}
+{% block content %}
+<div class="workspace-page workspace-admin">
+<div class="page-head"><div>
+  <div class="eyebrow">Administration</div>
+  <h1>Administration</h1>
+  <p class="sub">{% if user.is_system_admin %}Accounts and controlled master data.{% else %}Manage accounts, permissions and audit activity for {{ user.office_label }} only.{% endif %} There is no public registration anywhere in the system.</p>
+</div></div>
+
+<div class="row g-3 mb-4 workspace-overview">
+  <div class="col-6 col-lg-2"><a class="stat-card navy" href="{% url 'accounts:user_list' %}?status=active"><div class="label">Active users</div><div class="value">{{ user_count }}</div></a></div>
+  {% if user.is_system_admin %}<div class="col-6 col-lg-2"><a class="stat-card" href="{% url 'core:masterdata_list' 'offices' %}?status=active"><div class="label">Active offices</div><div class="value">{{ office_count }}</div></a></div>{% endif %}
+  {% if user.is_system_admin %}
+  <div class="col-6 col-lg-2"><a class="stat-card gold" href="{% url 'core:masterdata_list' 'document-types' %}?status=active"><div class="label">Active types</div><div class="value">{{ type_count }}</div></a></div>
+  <div class="col-6 col-lg-2"><a class="stat-card green" href="{% url 'core:masterdata_list' 'tags' %}?status=active"><div class="label">Active tags</div><div class="value">{{ tag_count }}</div></a></div>
+  <div class="col-6 col-lg-2"><a class="stat-card" href="{% url 'core:masterdata_list' 'metadata-rules' %}?status=active"><div class="label">Active rules</div><div class="value">{{ rule_count }}</div></a></div>
+  <div class="col-6 col-lg-2"><a class="stat-card navy" href="{% url 'core:masterdata_list' 'metadata-fields' %}?status=active"><div class="label">Active fields</div><div class="value">{{ field_count }}</div></a></div>
+  {% endif %}
+</div>
+
+<div class="row g-4 workspace-columns">
+  <div class="col-lg-7 workspace-primary">
+    <div class="card-udm"><div class="card-udm-head"><h2>What lives where</h2></div>
+      <div class="card-udm-body">
+        {% if user.is_system_admin %}
+        <p class="body-copy">Master data drives filing, filters and the metadata recommendations. Change it here — no code edits, no redeploy.</p>
+        <ul class="body-copy">
+          <li><strong>Document types</strong> — memorandum, letter, work order… also sets the number of years before the initial deletion review.</li>
+          <li><strong>Tags</strong> — the shared vocabulary used for filing and search.</li>
+          <li><strong>Metadata rules</strong> — "if the text contains X, propose tag/type/office Y".</li>
+          <li><strong>Metadata fields</strong> — extra fields that appear on every review screen.</li>
+        </ul>
+        {% else %}
+        <p class="body-copy">Your administrator role applies to your office only. Add staff accounts, set their roles and review your office's audit activity.</p>
+        <a class="btn btn-udm-outline" href="{% url 'accounts:user_list' %}">Manage your office's accounts</a>
+        {% endif %}
+        <a class="btn btn-udm-outline" href="{% url 'core:audit_log' %}">Open audit log</a>
+        {% if user.is_system_admin %}<div class="form-actions"><a class="btn btn-udm-outline" href="{% url 'core:office_schedule' %}">Office hours &amp; break</a><a class="btn btn-udm-outline" href="{% url 'core:masterdata_list' 'holidays' %}">Manage holidays</a></div>{% endif %}
+      </div>
+    </div>
+  </div>
+  <div class="col-lg-5 workspace-support">
+    <div class="card-udm"><div class="card-udm-head"><h2>Latest activity</h2><a class="small" href="{% url 'core:audit_log' %}">All</a></div>
+      <div class="card-udm-body">
+        {% for entry in recent_audit %}
+          <div class="py-2 {% if not forloop.last %}border-bottom{% endif %}">
+            <div class="body-copy">{{ entry.summary }}</div>
+            <div class="text-muted supporting-copy">{{ entry.actor_label }} · {{ entry.created_at|date:"d M Y, g:i A" }}</div>
+          </div>
+        {% empty %}<p class="text-muted mb-0">Nothing logged yet.</p>{% endfor %}
+      </div>
+    </div>
+  </div>
+</div>
+
+{% comment %}
+  Search activity across the whole university. It lived on Reports, which answers
+  for one office, where every reader of their own office's report saw every other
+  office's search terms. It is not scoped instead because `SearchQueryLog.user` is
+  nullable — a deleted account's searches survive with no user, and an office
+  filter would drop them silently.
+
+  System administrators only. This page also admits office administrators, whose
+  view "is still office-scoped" per AdminRequiredMixin; the view does not compute
+  these for them at all.
+{% endcomment %}
+{% if user.is_system_admin %}
+  <div class="row g-4 mt-1">
+    <div class="col-12">
+      <div class="card-udm">
+        <div class="card-udm-head">
+          <div>
+            <h2>Most used searches</h2>
+            <div class="report-caption">
+              Every office, since records began. Visible to system administrators only.
+              {% if search_analytics.queries %}Each bar is a query's share of all {{ search_analytics.queries }}.{% endif %}
+            </div>
+          </div>
+        </div>
+        <div class="card-udm-body">
+          <div class="row g-2 mb-3">
+            <div class="col-6"><div class="report-quality-row"><span>Queries</span><strong class="num">{{ search_analytics.queries }}</strong></div></div>
+            <div class="col-6"><div class="report-quality-row"><span>Result clicks</span><strong class="num">{{ search_analytics.clicks }}</strong></div></div>
+          </div>
+          {% for row in top_searches %}
+            <div class="report-series-item report-series-item--wide report-series-item--share{% if row.is_remainder %} report-series-item--remainder{% endif %}">
+              <span>{{ row.query|truncatechars:30 }} <small class="text-muted">· {{ row.clicks }} click{{ row.clicks|pluralize }}</small></span>
+              <div class="report-bar"><i class="bar-neutral" style="width:{{ row.bar_percent }}%"></i></div>
+              <strong class="num">{{ row.total }}</strong>
+              <span class="status-share num">{% share row.total search_analytics.queries %}</span>
+            </div>
+          {% empty %}
+            <div class="report-empty">No searches have been recorded.</div>
+          {% endfor %}
+        </div>
+      </div>
+    </div>
+  </div>
+{% endif %}
+</div>
+{% endblock %}

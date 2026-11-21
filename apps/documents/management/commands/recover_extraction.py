@@ -1,0 +1,25 @@
+"""Recover committed processing intents, preserving the original authority."""
+
+from django.core.management.base import BaseCommand
+
+from apps.documents.inference_jobs import recover_suggestions
+from apps.documents.processing import recover_processing
+from apps.documents.tag_application_jobs import recover_applications
+
+
+class Command(BaseCommand):
+    help = "Inventory recoverable source-unit jobs; --apply requeues eligible original intents."
+
+    def add_arguments(self, parser):
+        parser.add_argument("--limit", type=int, default=100)
+        parser.add_argument("--apply", action="store_true")
+
+    def handle(self, *args, **options):
+        result = recover_processing(limit=options["limit"], dry_run=not options["apply"])
+        self.stdout.write(
+            f"{'Dry run' if result['dry_run'] else 'Recovered'}: {result['count']} eligible processing intent(s)."
+        )
+        suggestions = recover_suggestions(limit=options["limit"], dry_run=not options["apply"])
+        self.stdout.write(f"{len(suggestions['intent_ids'])} eligible suggestion intent(s).")
+        applications = recover_applications(limit=options["limit"], dry_run=not options["apply"])
+        self.stdout.write(f"{len(applications['intent_ids'])} recoverable automatic-tag intent(s).")

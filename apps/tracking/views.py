@@ -1,0 +1,862 @@
+from __future__ import annotations
+
+import logging
+from datetime import datetime
+from urllib.parse import urlencode
+
+from django.conf import settings
+from django.contrib import messages
+from django.core.exceptions import PermissionDenied, ValidationError
+from django.db.models import F
+from django.http import FileResponse, Http404, HttpResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse
+from django.utils import timezone
+from django.views.generic import View
+
+from apps.accounts.models import Office
+from apps.core import analytics
+from apps.core import filters as core_filters
+from apps.core.business_time import office_hours_caveat
+from apps.core.file_history import current_tracking_files
+from apps.core.mixins import AppLoginRequiredMixin, OfficeAssignedMixin
+from apps.core.models import AuditLog
+from apps.core.pagination import paginate
+from apps.core.upload_forms import RecoverableUploadMixin, UploadFormRecovery
+from apps.core.utils import log_action, qr_svg, unsign_download
+
+from . import services
+from .filter_navigation import direction_filter_groups, tracking_view_link
+from .forms import (
+    DEADLINE_DATE,
+    DEADLINE_NONE,
+    END_OF_DAY,
+    SORT_CHOICES,
+    BulkConfirmReceiptForm,
+    CompleteForm,
+    ConfirmReceiptForm,
+    CreateRecordForm,
+    GrantAccessForm,
+    RemarkForm,
+    ReopenForm,
+    ReviewRouteForm,
+    RouteForm,
+    TrackingFilterForm,
+    status_pills,
+)
+from .models import (
+    QUIET_EVENTS,
+    Attachment,
+    RoutingStep,
+    Status,
+    TrackingRecord,
+)
+from .version_views import tracking_file_rows
+
+#: Rows of the pending-upload queue shown before it collapses to a link.
+PENDING_UPLOAD_SHOWN = 5
+
+#: Retired date-only session key, cleared after send. The persisted due_at is
+#: the source for a draft's complete deadline.
+DRAFT_DEADLINE_KEY = "draft_deadline_{pk}"
+
+
+def _get_record(request, pk) -> TrackingRecord:
+    records = TrackingRecord.objects.with_related().prefetch_related("document_types")
+    if request.user.is_office_admin and not request.user.is_system_admin:
+        records = records.visible_to(request.user)
+    record = get_object_or_404(records, pk=pk)
+    if not record.can_user_view(request.user):
+        raise PermissionDenied(
+            "This document has not been routed to your office and nobody has granted you access to it."
+        )
+    return record
+
+
+def _record_return_url(request, record):
+    """Retain a system administrator's validated display perspective only."""
+    if not request.user.is_system_admin or "office" not in request.GET:
+        return record.get_absolute_url()
+    resolved = core_filters.resolve(request)
+    office = "all" if resolved.all_offices else getattr(resolved.as_office, "pk", None)
+    return core_filters.link(record.get_absolute_url(), office=office)
+
+
+def _draft_offices(request, record):
+    """Restore the selected offices in their original order."""
+    office_ids = request.session.get(f"draft_offices_{record.pk}", [])
+    found = {office.pk: office for office in Office.objects.filter(pk__in=office_ids)}
+    return [found[pk] for pk in office_ids if pk in found]
+
+
+def _draft_deadline_initial(record):
+    deadline = timezone.localtime(record.due_at) if record.due_at else None
+    return {
+        "deadline_choice": DEADLINE_DATE if deadline else DEADLINE_NONE,
+        "due_date": deadline.date() if deadline else None,
+        # Blank means 23:59:59. An explicitly chosen 23:59:00 stays explicit.
+        "due_time": deadline.time() if deadline and deadline.time() != END_OF_DAY else None,
+    }
+
+
+def _deadline_summary(form):
+    """Summarize the fields being reviewed, including an invalid submission."""
+    if form["deadline_choice"].value() == DEADLINE_NONE:
+        return {"deadline": None}
+    raw_date, raw_time = form["due_date"].value(), form["due_time"].value()
+    try:
+        # Field parsing preserves a validly formatted past date/time even when
+        # the form's deadline rules reject it. cleaned_data removes such fields.
+        due_date = form.fields["due_date"].clean(raw_date)
+        due_time = form.fields["due_time"].clean(raw_time)
+    except ValidationError:
+        due_date = None
+    if not due_date:
+        return {"deadline_input": f"{raw_date or 'Date not set'}, {raw_time or 'end of day'}"}
+    return {
+        "deadline": timezone.make_aware(datetime.combine(due_date, due_time or END_OF_DAY)),
+        "deadline_end_of_day": due_time is None,
+    }
+
+
+def tracking_workspace_queryset(request):
+    """The same permission-scoped, filtered population for the table and CSV."""
+    resolved = core_filters.resolve(request)
+    form = TrackingFilterForm(core_filters.tracking_params(request, resolved) or None)
+    queue_office = services.ALL_OFFICES if resolved.all_offices else resolved.as_office
+    stage_office = queue_office if resolved.all_offices else queue_office or request.user.office
+    records = services.active_for(request.user).with_stage_for(stage_office)
+
+    # Apply every filter that validated, not only the all-or-nothing case.
+    # `if form.is_valid()` used to drop *all* filters when any one of them
+    # was unrecognised, so a stale link like "?scope=inbox&status=BOGUS"
+    # quietly returned every active record while looking like an inbox —
+    # the wrong answer presented as the right one.
+    form.is_valid()
+    data = getattr(form, "cleaned_data", {})
+    # Status, scope and overdue come from the resolver, not the form: it is
+    # what translates the two legacy spellings — `?status=OVERDUE` and
+    # `?scope=overdue` — into the overdue condition, so nothing downstream
+    # has to know they exist. Offices and owner the form still validates.
+    statuses = resolved.statuses
+    scope = resolved.scope
+    offices = data.get("offices")
+    owner = data.get("owner")
+
+    records = services.filter_records(
+        records, query=data.get("q"), status=statuses, offices=offices, overdue=resolved.overdue
+    )
+    # "View this page as office X", the same thing the dashboard's picker
+    # means, and gated the same way — services.scope_office decides, so the
+    # two pages cannot answer "whose queue is this" differently.
+    #
+    # For a queue that answers *for* an office the chosen one replaces the
+    # viewer's. For one that does not — Overdue, Pending upload — there is
+    # no such office to replace, so the picker narrows by the same
+    # originating-or-current pairing the dashboard scopes its panels with.
+    # The sentinel, not an Office, when a system administrator asked for
+    # every office — apply_scope drops the office term rather than
+    # falling back to the viewer's own.
+    # A default stage perspective does not narrow the visible population.
+    # Keeping queue_office separate preserves records shared by access grant;
+    # stage_office describes their row without imposing another content filter.
+    # The queue as `services.office_queue` builds it: the one place the
+    # office rule is written, shared with Search and the dashboard's Action
+    # Centre, so a count there is the number of rows here.
+    records = services.office_queue(records, scope, request.user, office=queue_office)
+    # A second, independent scope so the filter panel narrows *within* the
+    # queue the pill selected rather than replacing it: "Office files" while
+    # on Overdue means overdue records in your office, not one or the other.
+    # apply_scope no-ops on an empty value, so calling it twice is safe, and
+    # the .distinct() below absorbs any duplication from the stacked joins.
+    if owner:
+        records = services.apply_scope(records, owner, request.user)
+
+    return records, form, data, resolved, queue_office
+
+
+class RecordListView(AppLoginRequiredMixin, View):
+    """Active Document Tracking — newest first, completed records live in Documents."""
+
+    template_name = "tracking/list.html"
+
+    def get(self, request):
+        records, form, data, resolved, queue_office = tracking_workspace_queryset(request)
+        offices, owner = data.get("offices"), data.get("owner")
+
+        # Minus anything the resolver understood. The forms validate against the
+        # current vocabulary, so a bookmark reading `?status=OVERDUE` was
+        # honoured and warned about in the same breath.
+        unrecognised = sorted(set(form.errors) - set(resolved.translated))
+        if unrecognised:
+            messages.warning(
+                request,
+                "Ignored a filter that was not recognised: "
+                + ", ".join(unrecognised) + ". Showing the rest.",
+            )
+        # A filter that fails open is worse than one that errors: the reader
+        # believes the page is narrowed to one office and it is the whole
+        # university. `resolve` records what it refused rather than dropping it.
+        if resolved.invalid:
+            messages.warning(
+                request,
+                "Could not apply: " + ", ".join(resolved.invalid)
+                + ". The value was not recognised, or your account may not filter by office.",
+            )
+
+        # Sort. `data` holds only what the form validated, so an unrecognised
+        # `?sort=` is already gone by here and falls to the default — the same
+        # lenient handling every other filter on this page gets.
+        #
+        # `-last_movement_at` is the tie-break on both deadline orders, not just
+        # the default: two records due the same day should fall in the order the
+        # rest of the page uses rather than in whatever the database returns.
+        #
+        # nulls_last in *both* directions. A record with no deadline has not
+        # been scheduled at all, so it belongs after everything that has been —
+        # on "latest first" as much as on "soonest first", where NULL sorting
+        # high would put unscheduled work above the genuinely distant.
+        sort = data.get("sort") or ""
+        records = services.order_records(records.prefetch_related("document_types"), sort)
+        # Page size comes from the reader (`?per_page=`), defaulting to the
+        # workspace's own. See apps/core/pagination.py.
+        page_context = paginate(request, records, services.PAGE_SIZE)
+        page = page_context["page_obj"]
+        # Materialised once so the annotation below lands on the very objects
+        # the template iterates, not on a throwaway copy of the queryset.
+        page_records = list(page.object_list)
+        services.annotate_can_confirm(page_records, request.user)
+        services.annotate_receiving_offices(page_records)
+        # The same office the queue was built for. Tagged from the viewer's
+        # instead, every row of another office's Incoming read "Outgoing".
+        services.annotate_direction(page_records, request.user, office=queue_office)
+        services.annotate_stage(
+            page_records, request.user,
+            office=queue_office if resolved.all_offices else queue_office or request.user.office,
+        )
+
+        # The completed-but-unapproved queue. It sits on this page rather than
+        # on the repository page because these records have not reached the
+        # repository — approving them is the act that puts them there — and
+        # because approval is now a stage of the tracking lifecycle.
+        pending_upload = list(
+            services.pending_upload_for(request.user)
+            # nulls_last because Postgres sorts NULLs first on DESC, which would
+            # float a record with no completion time to the top of the queue.
+            .order_by(F("completed_at").desc(nulls_last=True))[: PENDING_UPLOAD_SHOWN + 1]
+        )
+        pending_upload_more = max(0, len(pending_upload) - PENDING_UPLOAD_SHOWN)
+        pending_upload = pending_upload[:PENDING_UPLOAD_SHOWN]
+        for record in pending_upload:
+            # Approval is one click from here; returning a record to tracking
+            # needs a written reason, so that action stays on the record page.
+            record.can_approve = record.can_user_approve_upload(request.user)
+
+        return render(
+            request,
+            self.template_name,
+            {
+                "form": form,
+                **page_context,
+                "records": page_records,
+                "sort_choices": SORT_CHOICES,
+                "selected_sort": sort,
+                "query": data.get("q") or "",
+                # The four stages offered as pills, and which are lit. A set of
+                # strings because that is what a template `in` test compares
+                # against — the resolver validated them already.
+                "status_choices": status_pills(form),
+                "selected_statuses": set(resolved.statuses),
+                # Why an empty table is empty, when it can never be anything
+                # else. Without it the reader concludes the filter is broken.
+                "impossible_reason": core_filters.impossible_reason(resolved),
+                "resolved": resolved,
+                "direction_filter_groups": direction_filter_groups(request, resolved),
+                "all_tracking_href": tracking_view_link(request, resolved),
+                # The picker is offered to whoever `scope_office` would honour
+                # the parameter for, so the control and the gate cannot drift.
+                "can_pick_office": request.user.is_system_admin,
+                # Hides the create/upload button from the accounts the
+                # target view would turn away. The view still refuses
+                # them on its own; this only stops offering a dead end.
+                "can_start_work": request.user.can_start_work,
+                "pending_upload": pending_upload,
+                "pending_upload_more": pending_upload_more,
+                # The pills need to know which of them are on. Resolved here as
+                # a set of strings rather than in the template, because the
+                # template would have to compare a model pk against the raw
+                # query values and those are strings.
+                "filter_offices": Office.active.all(),
+                "selected_office_ids": {str(office.pk) for office in (offices or [])},
+                "selected_owner": owner or "",
+                "can_bulk_receive": any(record.can_confirm_now for record in page_records),
+                # The paginator has already counted this queryset; calling
+                # .count() again would run the same DISTINCT-over-joins query
+                # a second time on every page load.
+                "total": page.paginator.count,
+                # No "querystring" here any more: the pagination partial reads
+                # request.GET itself, which is what stopped one page's links
+                # carrying another page's filters (or none at all).
+            },
+        )
+
+
+class RecordCreateView(RecoverableUploadMixin, OfficeAssignedMixin, View):
+    """Step 1 of 2 — capture details and save a draft (nothing is routed yet)."""
+
+    template_name = "tracking/create.html"
+
+    def _draft(self, request):
+        if "draft" not in request.GET:
+            return None
+        try:
+            pk = int(request.GET["draft"])
+        except (TypeError, ValueError) as exc:
+            raise Http404("Draft not found.") from exc
+        return _get_record(request, pk)
+
+    def _render_form(self, request, form, record=None):
+        return render(request, self.template_name, {
+            "form": form,
+            "record": record,
+            "attachments": current_tracking_files(record) if record else [],
+            "originating_office": record.originating_office if record else request.user.office,
+        })
+
+    def get(self, request):
+        record = self._draft(request)
+        if record is not None and record.status != Status.DRAFT:
+            return redirect(record.get_absolute_url())
+        initial = {}
+        if record is not None:
+            initial = {
+                **_draft_deadline_initial(record),
+                "receiving_offices": [office.pk for office in _draft_offices(request, record)],
+            }
+        recovery = UploadFormRecovery(request, "tracking-edit" if record else "tracking-create", target_id=record.pk if record else None,
+            factory=lambda data=None, files=None: CreateRecordForm(data, files, user=request.user, instance=record, initial=initial))
+        form = recovery.form
+        return self._render_form(request, form, record)
+
+    def post(self, request):
+        record = self._draft(request)
+        if record is not None and record.status != Status.DRAFT:
+            return redirect(record.get_absolute_url())
+        recovery = UploadFormRecovery(request, "tracking-edit" if record else "tracking-create", target_id=record.pk if record else None)
+        response = recovery.validation_response()
+        if response:
+            return response
+        result = recovery.finish()
+        if result is None:
+            return recovery.response
+        request.session[f"draft_offices_{result.parent_id}"] = [office.pk for office in recovery.form.cleaned_data["receiving_offices"]]
+        return redirect(result.redirect)
+
+
+class RecordReviewView(OfficeAssignedMixin, View):
+    """Step 2 of 2 — confirm, then the tracking number is routed and the slip exists."""
+
+    template_name = "tracking/review.html"
+
+    def _remembered(self, request, record):
+        """Offices picked on step 1, in the order they were picked.
+
+        `pk__in` returns rows in database order, not selection order, and
+        route_record() treats the first office as the one taking custody — so
+        the list is re-sorted to match what the user actually chose.
+        """
+        return _draft_offices(request, record)
+
+    def _context(self, request, record, form, offices):
+        if form.is_bound:
+            offices = list(form.cleaned_data.get("receiving_offices") or [])
+        return {
+            "record": record,
+            "attachments": current_tracking_files(record),
+            "form": form,
+            "offices": offices,
+            **_deadline_summary(form),
+            "receiving_offices_invalid": bool(form["receiving_offices"].errors),
+            "session_lost": not form.is_bound and not offices,
+        }
+
+    def get(self, request, pk):
+        record = _get_record(request, pk)
+        if record.status != Status.DRAFT:
+            return redirect(record.get_absolute_url())
+        offices = self._remembered(request, record)
+        form = ReviewRouteForm(
+            user=request.user,
+            record=record,
+            initial={
+                "receiving_offices": [office.pk for office in offices],
+                **_draft_deadline_initial(record),
+            },
+        )
+        return render(request, self.template_name, self._context(request, record, form, offices))
+
+    def post(self, request, pk):
+        record = _get_record(request, pk)
+        if record.status != Status.DRAFT:
+            return redirect(record.get_absolute_url())
+
+        form = ReviewRouteForm(request.POST, user=request.user, record=record)
+        if not form.is_valid():
+            messages.error(request, "Check the highlighted fields before sending.")
+            return render(
+                request, self.template_name, self._context(request, record, form, self._remembered(request, record))
+            )
+
+        # Keep the order the user picked; the first office takes custody.
+        picked = list(form.cleaned_data["receiving_offices"])
+        remembered_ids = request.session.get(f"draft_offices_{record.pk}", [])
+        if remembered_ids:
+            rank = {pk: index for index, pk in enumerate(remembered_ids)}
+            picked.sort(key=lambda office: rank.get(office.pk, len(rank)))
+
+        try:
+            services.route_record(
+                record,
+                picked,
+                user=request.user,
+                instructions=record.instructions,
+                action=RoutingStep.Action.SEND,
+                due_at=form.deadline_datetime(),
+            )
+        except ValidationError as exc:
+            messages.error(request, "; ".join(exc.messages))
+            return render(request, self.template_name, self._context(request, record, form, picked))
+
+        request.session.pop(f"draft_offices_{record.pk}", None)
+        request.session.pop(DRAFT_DEADLINE_KEY.format(pk=record.pk), None)
+        messages.success(
+            request,
+            f"{record.tracking_number} was routed. It stays “{Status.PENDING_RECEIPT.label}” until the "
+            "receiving office confirms it.",
+        )
+        return redirect(record.get_absolute_url())
+
+
+#: How many of the newest timeline entries stay expanded. Anything older folds
+#: behind a labelled control that names the number hidden — the history is
+#: append-only and grows for the life of the record, so a document that has
+#: been round five offices otherwise opens as a wall nobody reads.
+TIMELINE_VISIBLE = 5
+
+
+class RecordDetailView(RecoverableUploadMixin, AppLoginRequiredMixin, View):
+    template_name = "tracking/detail.html"
+
+    def get(self, request, pk):
+        record = _get_record(request, pk)
+        services.log_view(record, user=request.user)
+        # Takes a list, so one record is the same call the listing pages make.
+        # It answers "is this ours to act on" without reading the routing table.
+        resolved = core_filters.resolve(request)
+        stage_office = (
+            services.ALL_OFFICES if resolved.all_offices
+            else resolved.as_office or request.user.office
+        )
+        services.annotate_direction([record], request.user, office=stage_office)
+        services.annotate_stage([record], request.user, office=stage_office)
+        office_param = "all" if resolved.all_offices else getattr(stage_office, "pk", None)
+        # Split here rather than with |slice in the template. Django's slice
+        # filter fails *silently* on a queryset — negative indexing is
+        # unsupported, and the filter swallows the error and returns the whole
+        # thing, which would render every entry twice instead of raising.
+        steps = list(
+            record.routing_steps.select_related(
+                "from_office", "to_office", "sent_by", "received_by"
+            ).order_by("sequence")
+        )
+        services.annotate_receiving_offices([record], steps=steps)
+        # Office time at each hop, from the engine every turnaround figure uses.
+        # Attached to the step for the template; nothing is saved.
+        waits = analytics.record_waits(record, steps)
+        for step in steps:
+            step.waits = waits[step.pk]
+        activities = list(
+            record.activities.select_related("actor", "actor_office")
+            .exclude(event__in=QUIET_EVENTS)
+            .order_by("created_at", "id")
+        )
+        file_rows = tracking_file_rows(record, request.user, request=request)
+        attachments = [row["current"]["item"] for row in file_rows]
+        archived_document = getattr(record, "archived_document", None)
+        can_archive_now = archived_document is None and record.can_user_approve_upload(request.user)
+        # Filing a record handled by this office does not grant access to the
+        # originating office's repository. Keep the tracking history usable.
+        if archived_document is not None and not archived_document.can_user_view(request.user):
+            archived_document = None
+        can_reopen = record.can_user_reopen(request.user)
+        can_act = record.status != Status.DRAFT and record.can_user_act(request.user)
+        from apps.accounts.capabilities import permission_snapshot
+        allowed = permission_snapshot(request.user)['tracking']
+        can_complete = can_act and record.current_step_queryset.filter(received_at__isnull=False).exists()
+        remark_form = UploadFormRecovery(request, 'tracking-remark', target_id=record.pk).form if can_act and allowed['work'] else RemarkForm()
+        route_form = UploadFormRecovery(request, 'tracking-route', target_id=record.pk).form if can_act and allowed['endorse'] else RouteForm(record=record, user=request.user, auto_id='route_%s')
+        action_tab = 'endorse' if route_form.is_bound and allowed['endorse'] else next((key for key in ('work','endorse','complete','share') if allowed.get(key)), '')
+        return render(
+            request,
+            self.template_name,
+            {
+                "record": record,
+                "routing_slip_url": core_filters.link(
+                    reverse("tracking:routing_slip", args=[record.pk]), office=office_param,
+                ),
+                "record_action_urls": {
+                    action: core_filters.link(
+                        reverse(f"tracking:{action}", args=[record.pk]),
+                        office=office_param if request.user.is_system_admin and "office" in request.GET else None,
+                    )
+                    for action in [
+                        "confirm_receipt", "add_remark", "route", "complete",
+                        "grant_access", "archive", "reopen",
+                    ]
+                },
+                "stage_scope_label": (
+                    f"Status for {stage_office.name}" if not resolved.all_offices and stage_office
+                    else "Overall status"
+                ),
+                "steps": steps,
+                # Oldest first in both lists, so the fold takes the head and the
+                # tail stays open. A short list makes the head empty on its own,
+                # which is why neither slice needs a length check.
+                "older_steps": steps[:-TIMELINE_VISIBLE],
+                "recent_steps": steps[-TIMELINE_VISIBLE:],
+                "activities": activities,
+                "older_activities": activities[:-TIMELINE_VISIBLE],
+                "recent_activities": activities[-TIMELINE_VISIBLE:],
+                "older_attachments": attachments[:-TIMELINE_VISIBLE],
+                "recent_attachments": attachments[-TIMELINE_VISIBLE:],
+                "attachments": attachments,
+                "file_rows": file_rows,
+                "receipt_form": ConfirmReceiptForm(),
+                "remark_form": remark_form,
+                # Distinct IDs from RemarkForm's attachments; POST field names
+                # remain unchanged for the existing route endpoint.
+                "route_form": route_form,
+                "complete_form": CompleteForm(user=request.user, record=record),
+                "grant_form": GrantAccessForm(actor=request.user),
+                "pending_offices": record.awaiting_receipt_offices,
+                "can_act": can_act,
+                'action_tab': action_tab,
+                "can_complete": can_complete and allowed['complete'],
+                "can_complete_and_file": record.can_user_file_when_completed(request.user),
+                "can_confirm": record.can_user_confirm_receipt(request.user),
+                "can_archive_now": can_archive_now,
+                "can_reopen": can_reopen,
+                # One panel carries both filing actions, so it shows when either
+                # is on offer rather than repeating the condition in the markup.
+                "show_filing_panel": can_archive_now or can_reopen,
+                "reopen_form": ReopenForm(),
+                "archived_document": archived_document,
+                "office_hours_caveat": office_hours_caveat(),
+            },
+        )
+
+
+#: Each receipt form can return only to its own route with that page's filters.
+BULK_RECEIPT_RETURNS = {
+    "dashboard": ("core:dashboard", {"office", "desk", "ring", "month", "turnaround_stage"}),
+    "tracking": ("tracking:list", {"office", "scope", "status", "offices", "owner", "q", "sort", "overdue", "page", "per_page"}),
+}
+
+
+def _bulk_receipt_return(request):
+    """Return to the submitting queue so the reader can see the outcome."""
+    destination = BULK_RECEIPT_RETURNS.get(request.POST.get("next", ""))
+    if destination is None:
+        return core_filters.link(reverse("tracking:list"), scope=services.SCOPE_INCOMING)
+    route, allowed = destination
+    query = urlencode([(key, values) for key, values in request.GET.lists() if key in allowed], doseq=True)
+    return f"{reverse(route)}?{query}" if query else reverse(route)
+
+
+class BulkConfirmReceiptView(OfficeAssignedMixin, View):
+    def post(self, request):
+        available = services.inbox_for(request.user).with_related().distinct()
+        form = BulkConfirmReceiptForm(request.POST, queryset=available)
+        if not form.is_valid():
+            message = next(iter(form.errors.values()))[0] if form.errors else "Choose documents to receive."
+            messages.error(request, message)
+            return redirect(_bulk_receipt_return(request))
+        try:
+            steps = services.bulk_confirm_receipts(
+                form.cleaned_data["record_ids"], user=request.user, note=form.cleaned_data.get("note", "")
+            )
+        except (ValidationError, PermissionDenied) as exc:
+            messages.error(request, getattr(exc, "messages", [str(exc)])[0])
+            return redirect(_bulk_receipt_return(request))
+        messages.success(
+            request,
+            f"Receipt recorded for {len(steps)} selected document{'s' if len(steps) != 1 else ''}.",
+        )
+        return redirect(_bulk_receipt_return(request))
+
+
+class ConfirmReceiptView(OfficeAssignedMixin, View):
+    def post(self, request, pk):
+        record = _get_record(request, pk)
+        form = ConfirmReceiptForm(request.POST)
+        if not form.is_valid():
+            messages.error(request, "Could not read the receipt note.")
+            return redirect(_record_return_url(request, record))
+        try:
+            services.confirm_receipt(record, user=request.user, note=form.cleaned_data.get("note", ""))
+        except (ValidationError, PermissionDenied) as exc:
+            messages.error(request, getattr(exc, "messages", [str(exc)])[0])
+            return redirect(_record_return_url(request, record))
+        messages.success(
+            request,
+            f"Receipt recorded for {record.tracking_number} at {timezone.localtime():%d %b %Y, %I:%M %p}.",
+        )
+        return redirect(_record_return_url(request, record))
+
+
+class AddRemarkView(RecoverableUploadMixin, OfficeAssignedMixin, View):
+    def post(self, request, pk):
+        record = _get_record(request, pk)
+        if not record.can_user_act(request.user):
+            raise PermissionDenied("Confirm receipt before adding remarks to this document.")
+        recovery = UploadFormRecovery(request, "tracking-remark", target_id=record.pk)
+        response = recovery.validation_response()
+        if response:
+            return response
+        result = recovery.finish()
+        if result is None:
+            return recovery.response
+        messages.success(request, "Remark added to the routing history.")
+        return redirect(_record_return_url(request, record))
+
+
+class RouteRecordView(RecoverableUploadMixin, OfficeAssignedMixin, View):
+    def post(self, request, pk):
+        record = _get_record(request, pk)
+        if not record.can_user_act(request.user):
+            raise PermissionDenied("Only the office that currently holds the document can forward it.")
+        recovery = UploadFormRecovery(request, "tracking-route", target_id=record.pk)
+        response = recovery.validation_response()
+        if response:
+            return response
+        result = recovery.finish()
+        if result is None:
+            return recovery.response
+        messages.success(request, "Document routed. The receiving office must confirm receipt.")
+        return redirect(_record_return_url(request, record))
+
+
+class CompleteRecordView(OfficeAssignedMixin, View):
+    def post(self, request, pk):
+        record = _get_record(request, pk)
+        if not record.can_user_act(request.user):
+            raise PermissionDenied("Only the office holding the document can mark it completed.")
+        form = CompleteForm(request.POST, user=request.user, record=record)
+        if not form.is_valid():
+            messages.error(request, "Could not read the completion note.")
+            return redirect(_record_return_url(request, record))
+
+        try:
+            services.complete_record(record, user=request.user, note=form.cleaned_data.get("note", ""))
+        except ValidationError as exc:
+            messages.error(request, "; ".join(exc.messages))
+            return redirect(_record_return_url(request, record))
+        message = f"{record.tracking_number} is complete."
+
+        # "File it now" is only on offer to somebody who may also approve it.
+        # For everyone else completion ends here and the record waits in the
+        # pending-upload queue, which is the point of the stage: the person who
+        # declared the work done is not the person who files it.
+        if form.cleaned_data.get("archive_now") and record.can_user_approve_upload(request.user):
+            try:
+                document = services.approve_upload(record, user=request.user)
+                message += " It has been filed in the Document Repository."
+                messages.success(request, message)
+                return redirect(document.get_absolute_url() if document.can_user_view(request.user) else record.get_absolute_url())
+            except Exception:
+                logging.getLogger("doctrack").exception("Optional filing failed after completion for tracking record %s", record.pk)
+                messages.warning(
+                    request,
+                    "Completed, but filing failed. Retry approval from Pending Filing.",
+                )
+                return redirect(_record_return_url(request, record))
+
+        messages.success(
+            request, f"{message} It is waiting for an administrator to approve it into the repository."
+        )
+        return redirect(_record_return_url(request, record))
+
+
+class ApproveUploadView(OfficeAssignedMixin, View):
+    """Approve a finished record into the Document Repository.
+
+    Reachable two ways, both landing here: from the record page after reviewing
+    it, and straight from the pending-upload queue on the tracking list. The
+    queue form posts `next` so a one-click approval returns to the queue rather
+    than dropping the administrator into the document they just filed.
+    """
+
+    def post(self, request, pk):
+        record = _get_record(request, pk)
+        if not record.can_user_approve_upload(request.user):
+            raise PermissionDenied(
+                "Only an administrator for this document's office can approve it "
+                "into the Document Repository."
+            )
+        try:
+            document = services.approve_upload(record, user=request.user)
+        except (ValidationError, PermissionDenied) as exc:
+            messages.error(request, "; ".join(getattr(exc, "messages", [str(exc)])))
+            return redirect(_record_return_url(request, record))
+        messages.success(
+            request, f"{record.tracking_number} was approved into the Document Repository."
+        )
+        if request.POST.get("next") == "queue":
+            return redirect(f"{reverse('tracking:list')}?scope={services.SCOPE_PENDING_UPLOAD}")
+        if not document.can_user_view(request.user):
+            return redirect(_record_return_url(request, record))
+        return redirect(document.get_absolute_url())
+
+
+class ReopenRecordView(OfficeAssignedMixin, View):
+    """Send a completed-but-unfiled record back into active tracking."""
+
+    def post(self, request, pk):
+        record = _get_record(request, pk)
+        if not record.can_user_reopen(request.user):
+            raise PermissionDenied(
+                "Only records personnel or the office that completed this document "
+                "can return it to tracking."
+            )
+        form = ReopenForm(request.POST)
+        if not form.is_valid():
+            messages.error(request, "Say briefly why the record is going back.")
+            return redirect(_record_return_url(request, record))
+        try:
+            services.reopen_record(record, user=request.user, reason=form.cleaned_data["reason"])
+        except ValidationError as exc:
+            messages.error(request, "; ".join(exc.messages))
+            return redirect(_record_return_url(request, record))
+        messages.success(
+            request,
+            f"{record.tracking_number} is back in active tracking. The completion "
+            "stays in its history.",
+        )
+        return redirect(_record_return_url(request, record))
+
+
+class GrantAccessView(OfficeAssignedMixin, View):
+    def post(self, request, pk):
+        record = _get_record(request, pk)
+        if not record.can_user_grant_access(request.user):
+            raise PermissionDenied("Only the originating or holding office can share this record.")
+        form = GrantAccessForm(request.POST, actor=request.user)
+        if not form.is_valid():
+            messages.error(request, next(iter(form.errors.values()))[0])
+            return redirect(_record_return_url(request, record))
+        services.grant_access(
+            record,
+            user=request.user,
+            office=form.cleaned_data.get("office"),
+            target_user=form.cleaned_data.get("user"),
+            reason=form.cleaned_data.get("reason", ""),
+        )
+        messages.success(request, "Access granted.")
+        return redirect(_record_return_url(request, record))
+
+
+class RoutingSlipView(AppLoginRequiredMixin, View):
+    """Printable slip that always contains the complete movement history."""
+
+    template_name = "tracking/routing_slip.html"
+
+    def get(self, request, pk):
+        record = _get_record(request, pk)
+        # A slip documents movement and quotes the tracking number, and a draft
+        # has neither: its number is issued when it is sent. Refused before
+        # anything is logged, so no print of a placeholder reaches the audit log.
+        if not record.has_tracking_number:
+            messages.info(request, "A draft has no routing slip. Send it first; it gets its number then.")
+            return redirect(record.get_absolute_url())
+        # A paper slip leaves the system entirely, so both trails record who
+        # generated one before the browser ever opens the print dialog: the
+        # audit log for the administrator's view, and the record's own timeline
+        # so the print shows up beside the movements it documents.
+        entry = log_action(
+            AuditLog.Action.PRINT,
+            f"Generated the routing slip for {record.display_tracking_number}",
+            actor=request.user,
+            target=record,
+            request=request,
+        )
+        services.log_print(record, user=request.user)
+        resolved = core_filters.resolve(request)
+        stage_office = (
+            services.ALL_OFFICES if resolved.all_offices
+            else resolved.as_office or request.user.office
+        )
+        services.annotate_direction([record], request.user, office=stage_office)
+        services.annotate_stage([record], request.user, office=stage_office)
+        office_param = "all" if resolved.all_offices else getattr(stage_office, "pk", None)
+        return render(
+            request,
+            self.template_name,
+            {
+                "record": record,
+                "record_url": core_filters.link(record.get_absolute_url(), office=office_param),
+                "stage_scope_label": (
+                    f"Status for {stage_office.name}" if not resolved.all_offices and stage_office
+                    else "Overall status"
+                ),
+                "steps": record.routing_steps.select_related(
+                    "from_office", "to_office", "sent_by", "received_by"
+                ).order_by("sequence"),
+                "attachments": current_tracking_files(record),
+                "printed_at": timezone.localtime(),
+                "printed_by": request.user,
+                # Printed on the slip so a paper copy can be matched to the
+                # exact audit row that recorded it. log_action() never raises;
+                # it returns an unsaved entry if the write failed, hence the pk
+                # check rather than assuming there is one.
+                "print_reference": entry.pk if getattr(entry, "pk", None) else None,
+                "qr_svg": qr_svg(
+                    f"{settings.SITE_BASE_URL}{record.get_absolute_url()}" if settings.SITE_BASE_URL
+                    else request.build_absolute_uri(record.get_absolute_url()),
+                    label=f"QR code for {record.display_tracking_number}",
+                ),
+            },
+        )
+
+
+class AttachmentDownloadView(AppLoginRequiredMixin, View):
+    def get(self, request, pk):
+        from apps.accounts.capabilities import require_capability
+        require_capability(request.user, 'tracking', 'download')
+        attachments = Attachment.objects.select_related("record")
+        if request.user.is_office_admin and not request.user.is_system_admin:
+            attachments = attachments.filter(record__in=TrackingRecord.objects.visible_to(request.user))
+        attachment = get_object_or_404(attachments, pk=pk)
+        if not attachment.record.can_user_view(request.user):
+            raise PermissionDenied("You do not have access to this document.")
+        if unsign_download(request.GET.get("token", "")) != f"attachment:{attachment.pk}:{request.user.pk}":
+            raise PermissionDenied("This download link has expired or is invalid. Open the record to get a new link.")
+        from apps.core.file_views import private
+        from apps.core.storage import storage_identity
+        if not attachment.available_content:
+            return private(HttpResponse("This file content is no longer available.", status=410))
+        if attachment.storage_identity and attachment.storage_identity != storage_identity(attachment.file.storage):
+            return private(HttpResponse("This file's storage configuration changed. Contact an administrator.", status=410))
+        log_action(
+            AuditLog.Action.DOWNLOAD,
+            f"Downloaded {attachment.original_name} from {attachment.record.tracking_number}",
+            actor=request.user,
+            target=attachment.record,
+            request=request,
+        )
+        try:
+            response = FileResponse(attachment.file.open("rb"), as_attachment=True, filename=attachment.original_name)
+            response["X-Content-Type-Options"] = "nosniff"
+            response["Cache-Control"] = "private, no-store"
+            return response
+        except FileNotFoundError as exc:
+            raise Http404("The file is missing from storage.") from exc

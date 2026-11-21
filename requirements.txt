@@ -1,0 +1,49 @@
+# UDM DocTrack — Python dependencies
+# Install with:  pip install -r requirements.txt
+#
+# Versions use RANGES, not exact pins. An exact pin (==) breaks the moment a
+# teammate's Python version has no matching wheel — that is exactly what
+# happened with psycopg==3.2.3 on Python 3.14. Ranges let pip pick a build that
+# works on each machine while still refusing an untested major version.
+
+# --- Core ------------------------------------------------------------------
+# Django 5.2 LTS: supports Python 3.10 through 3.14, so the whole team can run
+# it whatever Python they installed. Security updates until at least 2028.
+Django>=5.2.17,<6.0
+psycopg[binary]>=3.2.10,<3.4     # PostgreSQL driver
+python-dotenv>=1.2.2,<2.0        # reads the .env file
+sqlparse>=0.6.0,<1.0            # patched Django SQL parsing dependency
+urllib3>=2.8.0,<3.0             # patched storage/HTTP client dependency
+certifi>=2026.10.19             # patched trust-store dependency for storage/HTTP clients
+whitenoise>=6.7.0,<7.0           # serves static files in production
+
+# --- Security --------------------------------------------------------------
+argon2-cffi>=23.1.0,<26.0        # password hashing (stronger than the default)
+regex>=2024.11.6,<2027.0        # timeouts for administrator-defined tag patterns
+django-axes>=6.5.1,<7.0          # locks accounts after repeated failed sign-ins
+# Pinned below 4.0 deliberately: django-csp 4.x replaced every CSP_* setting
+# with a single CONTENT_SECURITY_POLICY dict. Upgrading without rewriting
+# config/settings.py would silently stop sending CSP headers.
+django-csp>=3.8,<4.0             # Content-Security-Policy headers
+
+# --- Background jobs (no Redis needed) -------------------------------------
+django-q2>=1.7.2,<2.0
+
+# --- Text extraction -------------------------------------------------------
+pypdf>=6.21.4,<7.0               # patched malformed-PDF parsing; bounded source-unit configuration
+python-docx>=1.1.2,<2.0          # .docx files
+openpyxl>=3.1.5,<4.0             # .xlsx files
+defusedxml>=0.7.1,<0.8.0         # rejects XML entities during openpyxl streaming reads
+Pillow==13.0.0                  # bounded image/frame inspection (MIT-CMU)
+pypdfium2==5.14.0               # bounded PDF rendering; wheel bundles dependency licenses
+
+# --- Routing slips ---------------------------------------------------------
+# QR codes on the printed slip. Pure Python with no dependencies of its own and
+# writes SVG directly, so nothing here pulls in Pillow or a C toolchain.
+segno>=1.6.1,<2.0
+
+# --- File storage (only needed when STORAGE_BACKEND is not "local") --------
+django-storages[azure,s3]>=1.14.4,<2.0 # Azure Blob and Cloudflare R2 / S3-compatible storage
+
+# --- Production server -----------------------------------------------------
+gunicorn>=23.0.0,<24.0

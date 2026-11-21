@@ -1,0 +1,63 @@
+{% extends "base.html" %}
+{% load doctrack %}
+{% block title %}Notifications · {{ SITE_NAME }}{% endblock %}
+{% block content %}
+<div class="workspace-page workspace-notifications">
+<div class="page-head notification-page-head">
+  <div>
+    <div class="eyebrow">Account</div>
+    <h1>Notifications</h1>
+    <p class="sub">Updates for {{ user.office_label }}. Reading one does not clear it for your colleagues.</p>
+  </div>
+  {% if notification_count %}
+    <form method="post" action="{% url 'core:notification_mark_all_read' %}">
+      {% csrf_token %}
+      <button class="btn btn-udm-outline" type="submit">Mark all as read</button>
+    </form>
+  {% endif %}
+</div>
+
+<div class="notification-toolbar card-udm mb-4 workspace-toolbar">
+  <div class="card-udm-body d-flex flex-wrap align-items-center gap-2">
+    <nav class="notification-filters" aria-label="Notification filters">
+      <a class="notification-filter{% if active_filter == 'all' %} is-active{% endif %}" href="?filter=all{% if active_kind %}&kind={{ active_kind }}{% endif %}&per_page={{ page_size }}"{% if active_filter == 'all' %} aria-current="true"{% endif %}>All</a>
+      <a class="notification-filter{% if active_filter == 'unread' %} is-active{% endif %}" href="?filter=unread{% if active_kind %}&kind={{ active_kind }}{% endif %}&per_page={{ page_size }}"{% if active_filter == 'unread' %} aria-current="true"{% endif %}>Unread</a>
+    </nav>
+    <form id="notification-kind-filter" class="notification-kind-filter ms-auto" method="get" {% include "partials/_auto_filter_attrs.html" with filter_mode="change" %}>
+      <input type="hidden" name="filter" value="{{ active_filter }}">
+      {# Carried, or changing the type filter would reset the page length. #}
+      <input type="hidden" name="per_page" value="{{ page_size }}">
+      <label class="visually-hidden" for="notification-kind">Filter by type</label>
+      <select id="notification-kind" name="kind" class="form-select form-select-sm">
+        <option value="">All types</option>
+        {% for value, label in notification_kinds %}<option value="{{ value }}"{% if active_kind == value %} selected{% endif %}>{{ label }}</option>{% endfor %}
+      </select>
+      <button class="btn btn-udm-outline btn-sm" type="submit" data-filter-fallback>Apply</button>
+    </form>
+  </div>
+</div>
+
+<section id="notification-results" data-filter-region aria-labelledby="notification-list-heading">
+  <div class="d-flex flex-wrap align-items-baseline justify-content-between gap-3 mb-2 workspace-results-head">
+    <h2 id="notification-list-heading" class="section-title mb-0">{{ notification_count }} update{{ notification_count|pluralize }}</h2>
+    <span class="text-muted small">Unread updates appear first</span>
+  </div>
+  {% comment %}
+  Above the list. The page length and where in the results this page sits are
+  both wanted before working down the rows, and under a full page they are a
+  scroll away.
+{% endcomment %}
+  {% pager section="size" %}
+  <div class="notification-list">
+    {% for notification in notifications %}
+      {% if notification.show_day_header %}<h2 class="notification-day-heading">{{ notification.day_group }}</h2>{% endif %}
+      {% include "core/_notification_row.html" %}
+    {% empty %}
+      <div class="card-udm notification-empty"><div class="card-udm-body"><p class="mb-0 text-muted">There are no notifications matching these filters.</p></div></div>
+    {% endfor %}
+  </div>
+</section>
+
+{% pager section="steps" %}
+</div>
+{% endblock %}

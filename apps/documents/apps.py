@@ -1,0 +1,11 @@
+from django.apps import AppConfig
+
+
+class DocumentsConfig(AppConfig):
+    default_auto_field = "django.db.models.BigAutoField"
+    name = "apps.documents"
+    label = "documents"
+    verbose_name = "Document management (DMS)"
+
+    def ready(self):
+        from . import lifecycle_hooks  # noqa: F401

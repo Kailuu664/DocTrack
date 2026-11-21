@@ -1,0 +1,531 @@
+from __future__ import annotations
+
+from django.conf import settings
+from django.contrib import messages
+from django.contrib.auth.views import (
+    LoginView,
+    LogoutView,
+    PasswordChangeView,
+    PasswordResetCompleteView,
+    PasswordResetConfirmView,
+    PasswordResetDoneView,
+    PasswordResetView,
+)
+from django.core.exceptions import PermissionDenied, ValidationError
+from django.core.mail import send_mail
+from django.db import transaction
+from django.db.models import Count, Q
+from django.http import JsonResponse
+from django.shortcuts import get_object_or_404, redirect, render
+from django.urls import reverse, reverse_lazy
+from django.views.generic import TemplateView, View
+
+from apps.core.middleware import idle_seconds_for
+from apps.core.mixins import AdminRequiredMixin, AppLoginRequiredMixin, SystemAdminRequiredMixin
+from apps.core.models import AuditLog, NotificationPreference
+from apps.core.pagination import paginate
+from apps.core.security import allow_sensitive_request
+from apps.core.utils import client_ip, log_action
+
+from .email_verification import email_verification_token
+from .forms import (
+    AccountPasswordChangeForm,
+    AccountSetPasswordForm,
+    AdminSetPasswordForm,
+    AdminUserCreateForm,
+    AdminUserUpdateForm,
+    NotificationPreferenceForm,
+    OfficeForm,
+    ProfileForm,
+    SignInForm,
+    VerifiedEmailPasswordResetForm,
+)
+from .models import Office, User
+
+
+class PasswordResetAvailableMixin:
+    def dispatch(self, request, *args, **kwargs):
+        if not settings.EMAIL_CONFIGURED:
+            messages.info(request, "Password recovery email is not configured. Contact the system administrator.")
+            return redirect("accounts:login")
+        return super().dispatch(request, *args, **kwargs)
+
+
+class PasswordResetRequestView(PasswordResetAvailableMixin, PasswordResetView):
+    form_class = VerifiedEmailPasswordResetForm
+    template_name = "accounts/password_reset_form.html"
+    email_template_name = "accounts/password_reset_email.txt"
+    subject_template_name = "accounts/password_reset_subject.txt"
+    success_url = reverse_lazy("accounts:password_reset_done")
+
+    def form_valid(self, form):
+        address = client_ip(self.request)
+        email = form.cleaned_data["email"].strip().casefold()
+        if not allow_sensitive_request("password-reset-ip", address, limit=5, seconds=3600):
+            return redirect(self.success_url)
+        if not allow_sensitive_request("password-reset-email", email, limit=3, seconds=3600):
+            return redirect(self.success_url)
+        response = super().form_valid(form)
+        log_action(AuditLog.Action.UPDATE, "Password recovery requested", request=self.request, extra={"kind": "password_reset"})
+        return response
+
+
+class EmailVerificationRequestView(AppLoginRequiredMixin, View):
+    def post(self, request):
+        user = request.user
+        if not settings.EMAIL_CONFIGURED or not user.email:
+            messages.info(request, "Add an email address and ask the administrator to configure email delivery.")
+        elif user.email_is_verified:
+            messages.info(request, "Your email address is already verified.")
+        elif allow_sensitive_request("email-verification", user.pk, limit=3, seconds=3600):
+            token = email_verification_token.make_token(user)
+            path = reverse("accounts:verify_email_confirm", args=[user.pk, token])
+            url = settings.SITE_BASE_URL + path if settings.SITE_BASE_URL else request.build_absolute_uri(path)
+            send_mail("Verify your UDM DocTrack email", f"Sign in to your account and open this link to confirm your email:\n{url}\nRequest a new link if this one has expired.", settings.DEFAULT_FROM_EMAIL, [user.email])
+            messages.success(request, "Verification link sent. Check your email.")
+        else:
+            messages.info(request, "Please wait before requesting another verification link.")
+        return redirect("accounts:profile")
+
+
+class EmailVerificationConfirmView(AppLoginRequiredMixin, View):
+    def _valid(self, request, pk, token):
+        return request.user.pk == pk and bool(request.user.email) and email_verification_token.check_token(request.user, token)
+
+    def get(self, request, pk, token):
+        return render(request, "accounts/verify_email.html", {"validlink": self._valid(request, pk, token)})
+
+    def post(self, request, pk, token):
+        if self._valid(request, pk, token):
+            User.objects.filter(pk=pk, email=request.user.email).update(verified_email=request.user.email)
+            log_action(AuditLog.Action.UPDATE, "Verified own email address", actor=request.user, request=request)
+            messages.success(request, "Email verified. You can now use email password recovery.")
+            return redirect("accounts:profile")
+        return render(request, "accounts/verify_email.html", {"validlink": False}, status=400)
+
+
+class PasswordResetDonePage(PasswordResetAvailableMixin, PasswordResetDoneView):
+    template_name = "accounts/password_reset_done.html"
+
+
+class PasswordResetConfirmPage(PasswordResetAvailableMixin, PasswordResetConfirmView):
+    form_class = AccountSetPasswordForm
+    template_name = "accounts/password_reset_confirm.html"
+    success_url = reverse_lazy("accounts:password_reset_complete")
+
+    def dispatch(self, request, *args, **kwargs):
+        if request.method == "POST":
+            # Keep Django's existing token check and the password write in one
+            # transaction, so a concurrent reset cannot reuse an old token.
+            with transaction.atomic():
+                return super().dispatch(request, *args, **kwargs)
+        return super().dispatch(request, *args, **kwargs)
+
+    def get_user(self, uidb64):
+        user = super().get_user(uidb64)
+        if user is None:
+            return None
+        if self.request.method == "POST":
+            return User.objects.select_for_update().filter(pk=user.pk, is_active=True).first()
+        return user if user.is_active else None
+
+    def form_valid(self, form):
+        try:
+            response = super().form_valid(form)
+        except ValidationError as exc:
+            form.add_error(None, exc)
+            return self.form_invalid(form)
+        log_action(AuditLog.Action.UPDATE, "Password recovery completed", actor=getattr(self, "user", None), extra={"kind": "password_reset"})
+        return response
+
+
+class PasswordResetCompletePage(PasswordResetAvailableMixin, PasswordResetCompleteView):
+    template_name = "accounts/password_reset_complete.html"
+
+
+class SignInView(LoginView):
+    template_name = "accounts/login.html"
+    authentication_form = SignInForm
+    redirect_authenticated_user = True
+
+    def form_valid(self, form):
+        from . import otp
+
+        if otp.required():
+            try:
+                otp.begin(self.request, form.get_user(), return_url=self.get_success_url())
+            except ValidationError as exc:
+                form.add_error(None, exc)
+                return self.form_invalid(form)
+            return redirect('accounts:otp')
+        response = super().form_valid(form)
+        if self.request.user.must_change_password:
+            messages.info(self.request, "Please set a new password before you continue.")
+            return redirect("accounts:password_change")
+        return response
+
+
+class SignOutView(LogoutView):
+    next_page = reverse_lazy("accounts:login")
+
+
+class PasswordChangeViewCustom(AppLoginRequiredMixin, PasswordChangeView):
+    form_class = AccountPasswordChangeForm
+    template_name = "accounts/password_change.html"
+    success_url = reverse_lazy("core:dashboard")
+
+    def dispatch(self, request, *args, **kwargs):
+        if request.method == "POST" and request.user.is_authenticated:
+            # AuthenticationMiddleware may have loaded the account before an
+            # administrator suspended it or reset its password.
+            with transaction.atomic():
+                current = User.objects.select_for_update().filter(pk=request.user.pk).first()
+                if current is None:
+                    raise PermissionDenied("This account is no longer available.")
+                request.user = current
+                return super().dispatch(request, *args, **kwargs)
+        return super().dispatch(request, *args, **kwargs)
+
+    def form_valid(self, form):
+        from . import otp
+
+        had_otp = otp.verified(self.request)
+        try:
+            response = super().form_valid(form)
+        except ValidationError as exc:
+            form.add_error(None, exc)
+            return self.form_invalid(form)
+        User.objects.filter(pk=self.request.user.pk).update(must_change_password=False)
+        form.user.must_change_password = False
+        self.request.user = form.user
+        if had_otp:
+            otp.establish_proof(self.request, form.user)
+        # Only now is the sign-in fully complete, so this is where a forced
+        # password change forgives the lockout escalation (when configured to).
+        if getattr(settings, "AXES_ESCALATION_RESET_ON_LOGIN", False):
+            from .axes_hooks import clear_escalation
+
+            clear_escalation(username=self.request.user.get_username())
+        messages.success(self.request, "Password updated.")
+        log_action(AuditLog.Action.UPDATE, "Changed own password", actor=self.request.user, request=self.request)
+        return response
+
+
+class SessionKeepAliveView(AppLoginRequiredMixin, View):
+    """Push the idle sign-out back, and report how long is now left.
+
+    POST-only on purpose. Extending a session is a state change, and a GET that
+    silently kept people signed in could be triggered by a prefetch or a stray
+    link — the browser deciding on the user's behalf that somebody is still at
+    the desk.
+
+    There is nothing to do in the body: SESSION_SAVE_EVERY_REQUEST means the
+    session middleware rewrites the expiry on the way out of any request from a
+    signed-in user. The value returned is therefore what the expiry *will* be
+    once this response is written, not what it was on the way in.
+    """
+
+    def post(self, request):
+        # The role's own window, not the project default — an administrator's
+        # countdown must not be reset to a figure longer than their session.
+        return JsonResponse(
+            {"seconds_remaining": idle_seconds_for(request.user), "authenticated": True}
+        )
+
+
+class ProfileView(AppLoginRequiredMixin, View):
+    template_name = "accounts/profile.html"
+
+    def get(self, request):
+        preferences, _ = NotificationPreference.objects.get_or_create(user=request.user)
+        return render(request, self.template_name, {"form": ProfileForm(instance=request.user), "preferences_form": NotificationPreferenceForm(instance=preferences)})
+
+    def post(self, request):
+        preferences = NotificationPreference.objects.filter(user=request.user).first()
+        if preferences is None:
+            preferences = NotificationPreference(user=request.user)
+        form = ProfileForm(instance=request.user)
+        preferences_form = NotificationPreferenceForm(instance=preferences)
+        action = request.POST.get("action")
+        if action == "profile":
+            form = ProfileForm(request.POST, instance=request.user)
+            if form.is_valid():
+                # Personal details must not overwrite a concurrent password
+                # reset, suspension, office transfer, or role change.
+                profile = form.save(commit=False)
+                fields = ProfileForm.Meta.fields
+                if getattr(settings, 'EMAIL_OTP_REQUIRED', True):
+                    # An in-flight profile form can predate an email recovery.
+                    # The readonly contact field must never restore that factor.
+                    fields = tuple(field for field in fields if field != 'email')
+                profile.save(update_fields=fields)
+                messages.success(request, "Profile updated.")
+                return redirect("accounts:profile")
+        elif action == "preferences":
+            preferences_form = NotificationPreferenceForm(request.POST, instance=preferences)
+            if preferences_form.is_valid():
+                preferences_form.save()
+                messages.success(request, "Notification preferences updated.")
+                return redirect("accounts:profile")
+        else:
+            messages.error(request, "Choose a profile or notification preferences form to save.")
+            return render(request, self.template_name, {"form": form, "preferences_form": preferences_form}, status=400)
+        return render(request, self.template_name, {"form": form, "preferences_form": preferences_form})
+
+
+# ---------------------------------------------------------------------------
+# Administration — users
+# ---------------------------------------------------------------------------
+#: The account states the Users screen filters by. Suspended is what the screen
+#: and its buttons already call an inactive account.
+USER_STATUSES = {"active": "Active", "suspended": "Suspended"}
+
+
+class OfficeScopedUserMixin:
+    """Every account screen sees only the accounts its user may administer.
+
+    Without this the administration area was scoped by role and by nothing
+    else: an office administrator could list, edit, rename, reset the password
+    of, and suspend every account in the university, including the system
+    administrators. The role split in this change is what makes that a live
+    problem rather than a latent one — before it, everyone who could reach these
+    screens was global by definition.
+
+    Scoping the *queryset* rather than adding a check to each view is deliberate:
+    a missed check is a silent hole, whereas a missed queryset is a 404.
+    """
+
+    serialize_account_changes = True
+
+    def administrable_users(self):
+        users = User.objects.administrable_by(self.request.user).select_related("office")
+        if self.request.method not in {"GET", "HEAD", "OPTIONS"}:
+            # Recheck a target's office/role under a lock before editing it.
+            users = users.select_for_update(of=("self",))
+        return users
+
+    def selectable_offices(self):
+        if self.request.user.is_system_admin:
+            return Office.active.all()
+        return Office.active.filter(pk=self.request.user.office_id)
+
+
+class UserListView(OfficeScopedUserMixin, AdminRequiredMixin, TemplateView):
+    template_name = "administration/users.html"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        users = self.administrable_users()
+        query = self.request.GET.get("q", "").strip()
+        # Validated, not passed through. `office_id=<anything>` handed a
+        # non-numeric value straight to the ORM, so `?office=abc` — a stale
+        # link, a typo, or a probe — took the page down with "Field 'id'
+        # expected a number". A filter that cannot be honoured is dropped and
+        # said, never crashed on.
+        raw_office = self.request.GET.get("office", "").strip()
+        office = raw_office if raw_office.isascii() and raw_office.isdigit() and len(raw_office) <= 19 else ""
+        if office and not self.selectable_offices().filter(pk=office).exists():
+            office = ""
+        if raw_office and not office:
+            messages.warning(
+                self.request, "Ignored an office filter that was not recognised."
+            )
+        if query:
+            # Email too: it is the one detail an administrator is usually handed
+            # ("the account for j.cruz@…"), and the name columns missed it.
+            users = users.filter(
+                Q(username__icontains=query) | Q(first_name__icontains=query)
+                | Q(last_name__icontains=query) | Q(email__icontains=query)
+            )
+        if office:
+            users = users.filter(office_id=office)
+        # Role and status, validated the way office is: a value that is not one
+        # of the choices is dropped and said, never passed to the ORM.
+        raw_role = self.request.GET.get("role", "").strip()
+        role = raw_role if raw_role in User.Role.values else ""
+        raw_status = self.request.GET.get("status", "").strip()
+        status = raw_status if raw_status in USER_STATUSES else ""
+        if (raw_role and not role) or (raw_status and not status):
+            messages.warning(self.request, "Ignored a filter that was not recognised.")
+        if role:
+            users = users.filter(role=role)
+        if status:
+            users = users.filter(is_active=status == "active")
+        # Paged, where it used to render every account on one screen. A single
+        # office is a short list; the system administrator's view is every
+        # account in the university.
+        page_context = paginate(self.request, users.order_by("username"))
+        context.update(
+            {
+                **page_context,
+                "users": page_context["page_obj"].object_list,
+                "offices": self.selectable_offices(),
+                "roles": User.Role.choices,
+                "statuses": USER_STATUSES.items(),
+                "query": query,
+                "selected_office": office,
+                "selected_role": role,
+                "selected_status": status,
+                "is_filtered": bool(query or office or role or status),
+                "is_office_scoped": not self.request.user.is_system_admin,
+            }
+        )
+        return context
+
+
+class UserCreateView(OfficeScopedUserMixin, AdminRequiredMixin, View):
+    template_name = "administration/user_form.html"
+
+    def get(self, request):
+        return render(
+            request,
+            self.template_name,
+            {"form": AdminUserCreateForm(actor=request.user), "is_new": True},
+        )
+
+    def post(self, request):
+        form = AdminUserCreateForm(request.POST, actor=request.user)
+        if form.is_valid():
+            user = form.save()
+            log_action(
+                AuditLog.Action.CREATE,
+                f"Created account “{user.username}” ({user.get_role_display()})",
+                actor=request.user,
+                target=user,
+                request=request,
+            )
+            messages.success(
+                request,
+                f"Account created for {user.display_name}. Give them the username and the password you set.",
+            )
+            return redirect("accounts:user_list")
+        messages.error(request, "Check the highlighted fields.")
+        return render(request, self.template_name, {"form": form, "is_new": True})
+
+
+class UserUpdateView(OfficeScopedUserMixin, AdminRequiredMixin, View):
+    template_name = "administration/user_form.html"
+
+    def get(self, request, pk):
+        # Scoped queryset, so an account outside the administrator's office is a
+        # 404 rather than an editable form.
+        user = get_object_or_404(self.administrable_users(), pk=pk)
+        return render(
+            request,
+            self.template_name,
+            {"form": AdminUserUpdateForm(instance=user, editing_self=user.pk == request.user.pk,
+                                         actor=request.user),
+             "edited_user": user, "is_new": False,
+             "password_form": AdminSetPasswordForm(user)},
+        )
+
+    def post(self, request, pk):
+        user = get_object_or_404(self.administrable_users(), pk=pk)
+        if "set_password" in request.POST:
+            password_form = AdminSetPasswordForm(user, request.POST)
+            if password_form.is_valid():
+                password_form.save()
+                User.objects.filter(pk=user.pk).update(must_change_password=True)
+                log_action(
+                    AuditLog.Action.UPDATE,
+                    f"Reset the password of “{user.username}”",
+                    actor=request.user,
+                    target=user,
+                    request=request,
+                )
+                messages.success(request, f"New password set for {user.display_name}.")
+                return redirect("accounts:user_edit", pk=user.pk)
+            return render(
+                request,
+                self.template_name,
+                {"form": AdminUserUpdateForm(instance=user, editing_self=user.pk == request.user.pk,
+                                             actor=request.user),
+                 "edited_user": user, "is_new": False,
+                 "password_form": password_form},
+            )
+
+        form = AdminUserUpdateForm(
+            request.POST, instance=user, editing_self=user.pk == request.user.pk,
+            actor=request.user,
+        )
+        if form.is_valid():
+            form.save()
+            log_action(
+                AuditLog.Action.UPDATE, f"Updated account “{user.username}”", actor=request.user,
+                target=user, request=request,
+            )
+            messages.success(request, "Account updated.")
+            return redirect("accounts:user_list")
+        return render(
+            request,
+            self.template_name,
+            {"form": form, "edited_user": user, "is_new": False, "password_form": AdminSetPasswordForm(user)},
+        )
+
+
+class UserToggleActiveView(OfficeScopedUserMixin, AdminRequiredMixin, View):
+    def post(self, request, pk):
+        user = get_object_or_404(self.administrable_users(), pk=pk)
+        if user.pk == request.user.pk:
+            messages.error(request, "You cannot deactivate your own account.")
+            return redirect("accounts:user_list")
+        from .admin_safety import is_ready_system_admin, ready_system_admins
+        if is_ready_system_admin(user) and not ready_system_admins(exclude_ids=[user.pk]):
+            messages.error(request, 'Keep another ready system administrator before suspending this account.')
+            return redirect('accounts:user_list')
+        user.is_active = not user.is_active
+        user.save(update_fields=["is_active"])
+        log_action(
+            AuditLog.Action.UPDATE,
+            f"{'Reactivated' if user.is_active else 'Suspended'} account “{user.username}”",
+            actor=request.user,
+            target=user,
+            request=request,
+        )
+        messages.success(request, f"{user.display_name} is now {'active' if user.is_active else 'suspended'}.")
+        return redirect("accounts:user_list")
+
+
+# ---------------------------------------------------------------------------
+# Administration — offices
+# ---------------------------------------------------------------------------
+class OfficeListView(SystemAdminRequiredMixin, TemplateView):
+    """Offices are not any one office's to edit — see SystemAdminRequiredMixin.
+
+    This screen was open to every administrator, which after the role split
+    would have let an office head rename or deactivate other offices.
+    """
+
+    template_name = "administration/offices.html"
+
+    def get_context_data(self, **kwargs):
+        context = super().get_context_data(**kwargs)
+        context["offices"] = Office.objects.all().annotate(member_count=Count("members", distinct=True))
+        return context
+
+
+class OfficeEditView(SystemAdminRequiredMixin, View):
+    template_name = "administration/office_form.html"
+
+    def get(self, request, pk=None):
+        office = get_object_or_404(Office, pk=pk) if pk else None
+        return render(request, self.template_name, {"form": OfficeForm(instance=office), "office": office})
+
+    def post(self, request, pk=None):
+        office = get_object_or_404(Office, pk=pk) if pk else None
+        form = OfficeForm(request.POST, instance=office)
+        if form.is_valid():
+            from apps.search.indexing import save_masterdata_form
+
+            saved = save_masterdata_form(form)
+            log_action(
+                AuditLog.Action.UPDATE if pk else AuditLog.Action.CREATE,
+                f"{'Updated' if pk else 'Created'} office “{saved.name}”",
+                actor=request.user,
+                target=saved,
+                request=request,
+            )
+            messages.success(request, f"Saved office “{saved.name}”.")
+            return redirect("accounts:office_list")
+        messages.error(request, "Check the highlighted fields.")
+        return render(request, self.template_name, {"form": form, "office": office})
